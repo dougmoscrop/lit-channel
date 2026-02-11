@@ -1,0 +1,28 @@
+{
+  "name": "d2l-listen",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./d2l-channel.js": "./src/d2l-channel.js"
+  },
+  "scripts": {
+    "lint": "eslint . --fix",
+    "start": "web-dev-server --node-resolve --open --watch --app-index index.html",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "broadcast-channel": "^7.1.0",
+    "lit": "^3.2.0"
+  },
+  "devDependencies": {
+    "@web/dev-server": "^0.4.6",
+    "eslint": "^10.0.0",
+    "ws": "^8.19.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
