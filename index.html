@@ -3,51 +3,238 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<link rel="icon" href="data:;base64,iVBORw0KGgo=">
-		<title>d2l-channel demo</title>
+		<link rel="icon" href="data:;base64,iVBORw0KGgo=" />
+		<title>lit-channel demo</title>
 		<style>
+			:root {
+				--bg: #f4f6f8;
+				--surface: #ffffff;
+				--border: #d5dbe1;
+				--text: #102a43;
+				--muted: #486581;
+				--accent: #1f7a8c;
+				--accent-dark: #14586a;
+			}
+
+			* {
+				box-sizing: border-box;
+			}
+
 			body {
 				margin: 0;
 				padding: 24px;
-				font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-				background: #f7f7f8;
+				font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+				background: radial-gradient(circle at 20% -10%, #e8f2ff, transparent 40%), var(--bg);
+				color: var(--text);
 			}
+
 			main {
-				max-width: 760px;
+				max-width: 900px;
 				margin: 0 auto;
+			}
+
+			h1 {
+				margin-top: 0;
+				font-size: 2rem;
+			}
+
+			p {
+				margin-top: 0;
+				color: var(--muted);
+			}
+
+			.controls {
+				display: grid;
+				gap: 10px;
+				grid-template-columns: 1fr auto auto;
+				padding: 16px;
+				border: 1px solid var(--border);
+				border-radius: 10px;
+				background: var(--surface);
+				margin-bottom: 16px;
+			}
+
+			input,
+			button {
+				font: inherit;
+			}
+
+			input {
+				width: 100%;
+				padding: 10px 12px;
+				border: 1px solid var(--border);
+				border-radius: 8px;
+			}
+
+			button {
+				padding: 10px 14px;
+				border: 0;
+				border-radius: 8px;
+				background: var(--accent);
+				color: #fff;
+				cursor: pointer;
+			}
+
+			button:hover {
+				background: var(--accent-dark);
+			}
+
+			.grid {
+				display: grid;
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+				gap: 16px;
+			}
+
+			.panel {
+				border: 1px solid var(--border);
+				border-radius: 10px;
+				background: var(--surface);
+				padding: 12px;
+			}
+
+			h2 {
+				font-size: 1rem;
+				margin: 0 0 8px;
+			}
+
+			.feed {
+				list-style: none;
+				margin: 0;
+				padding: 0;
+				min-height: 180px;
+				max-height: 280px;
+				overflow: auto;
+			}
+
+			.feed li {
+				padding: 8px 0;
+				border-bottom: 1px solid #eef2f5;
+				font-size: 0.92rem;
+			}
+
+			.small {
+				font-size: 0.8rem;
+				color: var(--muted);
+			}
+
+			@media (max-width: 700px) {
+				.controls {
+					grid-template-columns: 1fr;
+				}
+
+				.grid {
+					grid-template-columns: 1fr;
+				}
 			}
 		</style>
 	</head>
 	<body>
 		<main>
-			<h1>d2l-channel</h1>
+			<h1>lit-channel</h1>
+			<p>Simple demo: type a message, send it to a channel, and watch both channel-specific and global events.</p>
 
-			<d2l-channel name="Announcements" description="Latest updates from your instructor">
-				<p>Welcome to the course! Please read the syllabus.</p>
-			</d2l-channel>
+			<section class="controls" aria-label="Message controls">
+				<input id="message" type="text" placeholder="Write a message" value="hello from the demo" />
+				<button id="send-announcements" type="button">Send to Announcements</button>
+				<button id="send-general" type="button">Send to General</button>
+			</section>
 
-			<br />
+			<lit-channel id="announcements-channel" name="Announcements"></lit-channel>
+			<lit-channel id="general-channel" name="General"></lit-channel>
 
-			<d2l-channel name="General" description="Open discussion"></d2l-channel>
+			<div class="grid">
+				<section class="panel">
+					<h2>Announcements</h2>
+					<ul id="announcements-feed" class="feed"></ul>
+				</section>
+				<section class="panel">
+					<h2>General</h2>
+					<ul id="general-feed" class="feed"></ul>
+				</section>
+			</div>
 
-			<h2 style="margin-top:24px">Event log</h2>
-			<ul id="log" style="font-size:14px;color:#333"></ul>
+			<section class="panel" style="margin-top: 16px;">
+				<h2>Global Event Log</h2>
+				<div class="small">Shows bubbled <code>lit-channel-send</code> and <code>lit-channel-message</code> events.</div>
+				<ul id="global-log" class="feed" style="min-height: 120px;"></ul>
+			</section>
 		</main>
 
 		<script type="module">
-			import '../src/d2l-channel.js'
+			import './src/lit-channel.js'
 
-			const log = document.getElementById('log')
+			const messageInput = document.getElementById('message')
+			const announcements = document.getElementById('announcements-channel')
+			const general = document.getElementById('general-channel')
+			const announcementsFeed = document.getElementById('announcements-feed')
+			const generalFeed = document.getElementById('general-feed')
+			const globalLog = document.getElementById('global-log')
+			const seenMessageIds = new Set()
 
-			function append(label, detail) {
-				const li = document.createElement('li')
-				const time = new Date(detail.payload.ts).toLocaleTimeString()
-				li.textContent = `[${time}] ${label} #${detail.topic}: ${detail.payload.text}`
-				log.prepend(li)
+			function stamp() {
+				return new Date().toLocaleTimeString()
 			}
 
-			document.addEventListener('d2l-channel-message', (e) => append('received', e.detail))
-			document.addEventListener('d2l-channel-send', (e) => append('sent', e.detail))
+			function appendLine(list, text) {
+				const item = document.createElement('li')
+				item.textContent = text
+				list.prepend(item)
+			}
+
+			function feedForTopic(topic) {
+				if (topic === 'Announcements') return announcementsFeed
+				if (topic === 'General') return generalFeed
+				return null
+			}
+
+			function messageId(detail) {
+				const text = detail?.payload?.text ?? ''
+				const ts = detail?.payload?.ts ?? ''
+				return `${detail.topic}::${ts}::${text}`
+			}
+
+			function appendTopicMessage(detail) {
+				const feed = feedForTopic(detail.topic)
+				if (!feed) return
+
+				const id = messageId(detail)
+				if (seenMessageIds.has(id)) return
+
+				seenMessageIds.add(id)
+				appendLine(feed, `[${stamp()}] ${detail.payload.text}`)
+			}
+
+			function getPayload() {
+				const text = messageInput.value.trim()
+				if (!text) return null
+				return { text, ts: Date.now() }
+			}
+
+			document.getElementById('send-announcements').addEventListener('click', () => {
+				const payload = getPayload()
+				if (payload) announcements.publish(payload)
+			})
+
+			document.getElementById('send-general').addEventListener('click', () => {
+				const payload = getPayload()
+				if (payload) general.publish(payload)
+			})
+
+			document.addEventListener('lit-channel-send', (event) => {
+				appendTopicMessage(event.detail)
+				appendLine(
+					globalLog,
+					`[${stamp()}] send #${event.detail.topic}: ${event.detail.payload.text}`
+				)
+			})
+
+			document.addEventListener('lit-channel-message', (event) => {
+				appendTopicMessage(event.detail)
+				appendLine(
+					globalLog,
+					`[${stamp()}] receive #${event.detail.topic}: ${event.detail.payload.text}`
+				)
+			})
 		</script>
 	</body>
 </html>

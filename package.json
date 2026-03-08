@@ -1,28 +1,45 @@
 {
-  "name": "d2l-listen",
+  "name": "lit-channel",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "./src/lit-channel.js",
   "exports": {
-    ".": "./index.js",
-    "./d2l-channel.js": "./src/d2l-channel.js"
+    ".": "./src/lit-channel.js",
+    "./lit-channel.js": "./src/lit-channel.js"
   },
   "scripts": {
     "lint": "eslint . --fix",
-    "start": "web-dev-server --node-resolve --open --watch --app-index index.html",
-    "test": "echo \"No tests yet\" && exit 0"
+    "start": "web-dev-server --open",
+    "build": "rollup -c",
+    "test": "wtr",
+    "test:watch": "wtr --watch",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
-    "broadcast-channel": "^7.1.0",
-    "lit": "^3.2.0"
+    "broadcast-channel": "^7.1.0"
+  },
+  "peerDependencies": {
+    "lit": "^3"
   },
   "devDependencies": {
+    "@esm-bundle/chai": "^4.3.4-fix.0",
+    "@open-wc/testing": "^4.0.0",
+    "@playwright/test": "^1.58.2",
+    "@types/mocha": "^10.0.10",
     "@web/dev-server": "^0.4.6",
+    "@web/rollup-plugin-import-meta-assets": "^2.3.2",
+    "@web/test-runner": "^0.20.2",
+    "@web/test-runner-playwright": "^0.11.1",
     "eslint": "^10.0.0",
+    "playwright": "^1.58.2",
     "ws": "^8.19.0"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": ""
+  "keywords": ["lit", "web components", "pub-sub", "websocket"],
+  "repository": {
+	"type": "git",
+	"url": "https://github.com/dougmoscrop/lit-channel.git"
+  },
+  "author": "Doug Moscrop <doug.moscrop@gmail.com>",
+  "license": "MIT",
+  "description": "Lightweight pub-sub over a multiplexed websocket for Lit"
 }

@@ -6,14 +6,15 @@
  * the single WebSocket to the backend. Non-leader tabs send/receive via
  * the BroadcastChannel; the leader relays between the BC and the WS.
  *
- * Returns a port-like object ({ postMessage, onmessage }) so connection.js
+ * Returns a port-like object ({ postMessage, onmessage }) so SharedSocket.js
  * can use it as a drop-in replacement for a SharedWorker MessagePort.
  */
 import { BroadcastChannel, createLeaderElection } from 'broadcast-channel'
 
-const BC_NAME = 'd2l-channel-transport'
+const BC_NAME = 'lit-channel-transport'
 
-export function createBroadcastTransport() {
+export function createBroadcastTransport(options = {}) {
+	const websocketUrl = options.endpoint ?? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/ws`
 	const bc = new BroadcastChannel(BC_NAME)
 	const elector = createLeaderElection(bc)
 
@@ -32,7 +33,7 @@ export function createBroadcastTransport() {
 	// ---- WebSocket (leader only) ----
 
 	function connectWebSocket() {
-		ws = new WebSocket(`ws://${location.host}/api/ws`)
+		ws = new WebSocket(websocketUrl)
 
 		ws.addEventListener('open', () => {
 			for (const topic of wsSubscribedTopics) {
@@ -43,6 +44,7 @@ export function createBroadcastTransport() {
 		ws.addEventListener('message', (e) => {
 			const msg = JSON.parse(e.data)
 			if (msg.type === 'message' && msg.topic) {
+				// Relay server messages to all tabs (including ourselves)
 				_onmessage?.({ data: msg })
 				bc.postMessage(msg)
 			}
@@ -84,11 +86,15 @@ export function createBroadcastTransport() {
 	bc.onmessage = (msg) => {
 		switch (msg.type) {
 			case 'publish':
+				// Another tab published — deliver locally to our listeners
 				_onmessage?.({ data: { type: 'message', topic: msg.topic, payload: msg.payload } })
+				// Leader relays to server (server will NOT echo back to us,
+				// so no duplicate delivery)
 				if (isLeader) wsSend(msg)
 				break
 
 			case 'message':
+				// Server-originated message relayed by the leader
 				_onmessage?.({ data: msg })
 				break
 
@@ -98,13 +104,23 @@ export function createBroadcastTransport() {
 					wsSend({ type: 'subscribe', topic: msg.topic })
 				}
 				break
+
+			case 'unsubscribe':
+				if (isLeader && wsSubscribedTopics.has(msg.topic)) {
+					wsSubscribedTopics.delete(msg.topic)
+					wsSend({ type: 'unsubscribe', topic: msg.topic })
+				}
+				break
 		}
 	}
 
-	// ---- port-like interface for connection.js ----
+	// ---- port-like interface for SharedSocket.js ----
 
 	return {
-		/** Mirror of MessagePort.postMessage */
+		/**
+		 * Mirror of MessagePort.postMessage
+		 * @param {{ type: any; topic: any; payload: any; }} msg
+		 */
 		postMessage(msg) {
 			const { type, topic, payload } = msg
 
@@ -146,10 +162,10 @@ export function createBroadcastTransport() {
 
 		start() { /* no-op, compat with MessagePort */ },
 
-		close() {
+		async close() {
 			teardownWebSocket()
-			elector.die()
-			bc.close()
+			await elector.die()
+			await bc.close()
 		},
 	}
 }

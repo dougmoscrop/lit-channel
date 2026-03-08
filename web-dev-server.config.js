@@ -1,15 +1,16 @@
-import { matchRoute } from './test-api/routes.js'
-import { wsPlugin } from './test-api/ws-plugin.js'
+import { sharedWorkerPlugin } from './dev/shared-worker-plugin.js'
+import { matchRoute } from './dev/routes.js'
+import { wsPlugin } from './dev/ws-plugin.js'
 
 export default {
 	nodeResolve: {
 		browser: true,
 		exportConditions: ['browser', 'import'],
 	},
-	open: true,
+	open: false,
 	watch: true,
 	appIndex: 'index.html',
-	plugins: [wsPlugin()],
+	plugins: [sharedWorkerPlugin(), wsPlugin()],
 	middleware: [
 		// Serve /api/* requests from the test API routes
 		async function apiMiddleware(ctx, next) {

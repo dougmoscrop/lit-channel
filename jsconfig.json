@@ -1,0 +1,13 @@
+{
+	"compilerOptions": {
+		"checkJs": true,
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"target": "ESNext",
+		"strict": false,
+		"noEmit": true,
+		"types": ["mocha", "node"]
+	},
+	"include": ["src/**/*.js", "dev/**/*.js", "test/**/*.js"],
+	"exclude": ["node_modules"]
+}
