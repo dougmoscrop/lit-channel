@@ -8,10 +8,18 @@
  *
  * Returns a port-like object ({ postMessage, onmessage }) so SharedSocket.js
  * can use it as a drop-in replacement for a SharedWorker MessagePort.
+ *
+ * Features:
+ * - Automatic reconnection with exponential backoff
+ * - WebSocket health checks via ping/pong
+ * - Resubscription recovery on reconnect
  */
 import { BroadcastChannel, createLeaderElection } from 'broadcast-channel'
 
 const BC_NAME = 'lit-channel-transport'
+const LEADER_PING_INTERVAL = 30000  // Send pings every 30 seconds
+const LEADER_PING_TIMEOUT = 10000   // Expect pong within 10 seconds
+const LEADER_PING_MAX_MISSES = 3    // Close after 3 consecutive missed pongs
 
 export function createBroadcastTransport(options = {}) {
 	const websocketUrl = options.endpoint ?? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/ws`
@@ -21,6 +29,12 @@ export function createBroadcastTransport(options = {}) {
 	let ws = null
 	let reconnectTimer = null
 	let isLeader = false
+	let lastPongTime = 0
+	let lastInboundTime = 0
+	let pingTimer = null
+	let wsHealthCheckInterval = null
+	let wsHealthCheckMissCount = 0
+    const pendingWsMessages = []
 
 	/** ALL locally-subscribed topics (tracked regardless of leader status) */
 	const localTopics = new Set()
@@ -32,41 +46,144 @@ export function createBroadcastTransport(options = {}) {
 
 	// ---- WebSocket (leader only) ----
 
+	function startWsHealthCheck() {
+		if (wsHealthCheckInterval) return
+		console.log('[bc-transport] starting WebSocket health checks')
+		lastPongTime = Date.now()
+		lastInboundTime = Date.now()
+		wsHealthCheckMissCount = 0
+
+		wsHealthCheckInterval = setInterval(() => {
+			if (!ws || ws.readyState !== WebSocket.OPEN) {
+				stopWsHealthCheck()
+				return
+			}
+
+			const timeSinceLastPong = Date.now() - lastPongTime
+			if (timeSinceLastPong > LEADER_PING_TIMEOUT) {
+				wsHealthCheckMissCount++
+				console.warn('[bc-transport] ws pong timeout, miss count=%d', wsHealthCheckMissCount)
+
+				if (wsHealthCheckMissCount >= LEADER_PING_MAX_MISSES) {
+					console.warn('[bc-transport] ws considered stale after %d missed pongs, reconnecting', wsHealthCheckMissCount)
+					stopWsHealthCheck()
+					ws.close()
+					return
+				}
+			}
+
+			// Send ping
+			try {
+				ws.send(JSON.stringify({ type: 'ping' }))
+				lastPongTime = Date.now() // will be updated by pong response
+			} catch (err) {
+				console.warn('[bc-transport] failed to send ping:', err)
+			}
+		}, LEADER_PING_INTERVAL)
+	}
+
+	function stopWsHealthCheck() {
+		if (wsHealthCheckInterval) {
+			clearInterval(wsHealthCheckInterval)
+			wsHealthCheckInterval = null
+		}
+		if (pingTimer) {
+			clearTimeout(pingTimer)
+			pingTimer = null
+		}
+	}
+
 	function connectWebSocket() {
+		console.log('[bc-transport] leader connecting WebSocket')
 		ws = new WebSocket(websocketUrl)
+		lastPongTime = Date.now()
+		lastInboundTime = Date.now()
+		wsHealthCheckMissCount = 0
 
 		ws.addEventListener('open', () => {
+			console.log('[bc-transport] ws open, resubscribing %d topics', wsSubscribedTopics.size)
+			lastPongTime = Date.now()
+			lastInboundTime = Date.now()
+			startWsHealthCheck()
+
 			for (const topic of wsSubscribedTopics) {
 				ws.send(JSON.stringify({ type: 'subscribe', topic }))
+			}
+
+			if (pendingWsMessages.length > 0) {
+				console.log('[bc-transport] flushing %d queued ws messages', pendingWsMessages.length)
+				while (pendingWsMessages.length > 0) {
+					const queued = pendingWsMessages.shift()
+					ws.send(JSON.stringify(queued))
+				}
 			}
 		})
 
 		ws.addEventListener('message', (e) => {
-			const msg = JSON.parse(e.data)
-			if (msg.type === 'message' && msg.topic) {
-				// Relay server messages to all tabs (including ourselves)
-				_onmessage?.({ data: msg })
-				bc.postMessage(msg)
+			lastPongTime = Date.now()  // Update health on any message
+			lastInboundTime = Date.now()
+
+			try {
+				const msg = JSON.parse(e.data)
+
+				if (msg.type === 'ping') {
+					wsSend({ type: 'pong' })
+					return
+				}
+
+				if (msg.type === 'pong') {
+					console.debug('[bc-transport] received pong from server')
+					return
+				}
+
+				if (msg.type === 'message' && msg.topic) {
+					// Relay server messages to all tabs (including ourselves)
+					_onmessage?.({ data: msg })
+					bc.postMessage(msg)
+				}
+			} catch (err) {
+				console.error('[bc-transport] error parsing message:', err)
 			}
 		})
 
-		ws.addEventListener('close', () => scheduleReconnect())
-		ws.addEventListener('error', () => ws.close())
+		ws.addEventListener('close', () => {
+			console.log('[bc-transport] ws closed')
+			stopWsHealthCheck()
+			scheduleReconnect()
+		})
+
+		ws.addEventListener('error', (err) => {
+			console.warn('[bc-transport] ws error:', err)
+			stopWsHealthCheck()
+			ws.close()
+		})
 	}
 
 	function scheduleReconnect() {
 		clearTimeout(reconnectTimer)
-		reconnectTimer = setTimeout(connectWebSocket, 3000)
+		// Exponential backoff: 1s, 2s, 4s up to 30s
+		const backoffMs = Math.min(1000 * Math.pow(2, Math.floor(wsHealthCheckMissCount / 2)), 30000)
+		console.log('[bc-transport] scheduling reconnect in %dms', backoffMs)
+		reconnectTimer = setTimeout(connectWebSocket, backoffMs)
 	}
 
 	function wsSend(data) {
 		if (ws?.readyState === WebSocket.OPEN) {
-			ws.send(JSON.stringify(data))
+			try {
+				ws.send(JSON.stringify(data))
+				return
+			} catch (err) {
+				console.error('[bc-transport] failed to send to WebSocket:', err)
+			}
 		}
+
+		pendingWsMessages.push(data)
+		if (pendingWsMessages.length > 512) pendingWsMessages.shift()
 	}
 
 	function teardownWebSocket() {
 		clearTimeout(reconnectTimer)
+		stopWsHealthCheck()
 		ws?.close()
 		ws = null
 	}
@@ -74,6 +191,7 @@ export function createBroadcastTransport(options = {}) {
 	// ---- Leader lifecycle ----
 
 	function becomeLeader() {
+		console.log('[bc-transport] became leader')
 		isLeader = true
 		for (const topic of localTopics) wsSubscribedTopics.add(topic)
 		connectWebSocket()

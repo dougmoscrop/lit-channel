@@ -1,4 +1,4 @@
-console.log('[shared-worker] loaded')
+console.log('[shared-worker] loaded!!!!')
 
 /** @type {Map<MessagePort, boolean>} port → alive flag (set true on pong) */
 const ports = new Map()
@@ -8,26 +8,105 @@ const topicPorts = new Map()
 let ws
 let reconnectTimer
 let heartbeatInterval
+let wsHealthCheckInterval
+let lastWsPingAt = 0
+let lastWsInboundAt = 0
+let awaitingWsPong = false
+let wsHealthCheckMissCount = 0
+const pendingWsMessages = []
 let endpoint = `${self.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${self.location.host}/api/ws`
 
 const HEARTBEAT_MS = 30000
+const WS_PING_INTERVAL_MS = 30000
+const WS_PONG_TIMEOUT_MS = 10000
+const WS_HEALTH_CHECK_MAX_MISSES = 3
 
 // ---------- WebSocket ----------
+
+function startWsHealthCheck() {
+	if (wsHealthCheckInterval) return
+	console.log('[shared-worker] starting ws health checks (every %dms)', WS_PING_INTERVAL_MS)
+	lastWsPingAt = 0
+	lastWsInboundAt = Date.now()
+	awaitingWsPong = false
+	wsHealthCheckMissCount = 0
+
+	wsHealthCheckInterval = setInterval(() => {
+		if (!ws || ws.readyState !== WebSocket.OPEN) {
+			stopWsHealthCheck()
+			return
+		}
+
+		const now = Date.now()
+
+		// Check for pong timeout
+		if (awaitingWsPong && now - lastWsPingAt > WS_PONG_TIMEOUT_MS) {
+			awaitingWsPong = false
+			wsHealthCheckMissCount++
+			console.warn('[shared-worker] ws pong timeout, miss count=%d', wsHealthCheckMissCount)
+			if (wsHealthCheckMissCount >= WS_HEALTH_CHECK_MAX_MISSES) {
+				console.warn('[shared-worker] ws considered stale after %d missed pongs, reconnecting', wsHealthCheckMissCount)
+				stopWsHealthCheck()
+				ws.close()
+				return
+			}
+		}
+
+		// Send ping when enough time has passed and we're not waiting for a pong
+		if (!awaitingWsPong) {
+			lastWsPingAt = now
+			awaitingWsPong = true
+			send({ type: 'ping' })
+		}
+	}, WS_PING_INTERVAL_MS)
+}
+
+function stopWsHealthCheck() {
+	if (wsHealthCheckInterval) {
+		clearInterval(wsHealthCheckInterval)
+		wsHealthCheckInterval = null
+	}
+}
 
 function connectWebSocket() {
 	console.log('[shared-worker] connecting ws...')
 	ws = new WebSocket(endpoint)
+	lastWsPingAt = 0
+	lastWsInboundAt = Date.now()
+	awaitingWsPong = false
+	wsHealthCheckMissCount = 0
 
 	ws.addEventListener('open', () => {
 		console.log('[shared-worker] ws open, resubscribing %d topics', topicPorts.size)
+		lastWsPingAt = Date.now() - WS_PING_INTERVAL_MS
+		lastWsInboundAt = Date.now()
+		startWsHealthCheck()
 		for (const topic of topicPorts.keys()) {
 			ws.send(JSON.stringify({ type: 'subscribe', topic }))
+		}
+		// Flush any queued outbound messages that were published while reconnecting.
+		if (pendingWsMessages.length > 0) {
+			console.log('[shared-worker] flushing %d queued ws messages', pendingWsMessages.length)
+			while (pendingWsMessages.length > 0) {
+				const queued = pendingWsMessages.shift()
+				ws.send(JSON.stringify(queued))
+			}
 		}
 	})
 
 	ws.addEventListener('message', (e) => {
+		lastWsInboundAt = Date.now()
 		const msg = JSON.parse(e.data)
 		console.log('[shared-worker] ws message:', msg)
+		if (msg.type === 'ping') {
+			send({ type: 'pong' })
+			return
+		}
+		if (msg.type === 'pong') {
+			awaitingWsPong = false
+			wsHealthCheckMissCount = 0
+			return
+		}
 		if (msg.type === 'message' && msg.topic) {
 			const subs = topicPorts.get(msg.topic)
 			console.log('[shared-worker] delivering topic=%s to %d ports', msg.topic, subs?.size ?? 0)
@@ -37,22 +116,39 @@ function connectWebSocket() {
 		}
 	})
 
-	ws.addEventListener('close', () => {
-		console.log('[shared-worker] ws closed')
+	ws.addEventListener('close', (event) => {
+		console.log('[shared-worker] ws closed code=%s reason=%s clean=%s', event?.code, event?.reason || '', event?.wasClean)
+		stopWsHealthCheck()
 		scheduleReconnect()
 	})
-	ws.addEventListener('error', () => ws.close())
+	ws.addEventListener('error', () => {
+		console.warn('[shared-worker] ws error')
+		stopWsHealthCheck()
+		ws.close()
+	})
 }
 
 function scheduleReconnect() {
 	clearTimeout(reconnectTimer)
-	reconnectTimer = setTimeout(connectWebSocket, 3000)
+	// Exponential backoff: 1s, 2s, 4s up to 30s
+	const backoffMs = Math.min(1000 * Math.pow(2, Math.floor(wsHealthCheckMissCount / 2)), 30000)
+	console.log('[shared-worker] scheduling reconnect in %dms', backoffMs)
+	reconnectTimer = setTimeout(connectWebSocket, backoffMs)
 }
 
 function send(data) {
 	console.log('[shared-worker] send:', data, 'ws.readyState=%s', ws?.readyState)
 	if (ws?.readyState === WebSocket.OPEN) {
 		ws.send(JSON.stringify(data))
+		return
+	}
+
+	// Queue outbound operations during reconnect windows so transient outages
+	// do not drop short-lived signals like typing indicators.
+	if (data?.type === 'publish' || data?.type === 'subscribe' || data?.type === 'unsubscribe' || data?.type === 'ping' || data?.type === 'pong') {
+		pendingWsMessages.push(data)
+		// Keep queue bounded to avoid unbounded growth under prolonged disconnects.
+		if (pendingWsMessages.length > 512) pendingWsMessages.shift()
 	}
 }
 
@@ -123,8 +219,9 @@ function removePort(port) {
 		}
 	}
 	if (ports.size === 0) {
-		console.log('[shared-worker] no ports left, stopping heartbeat')
+		console.log('[shared-worker] no ports left, stopping heartbeat and ws health checks')
 		stopHeartbeat()
+		stopWsHealthCheck()
 	}
 }
 
@@ -135,19 +232,26 @@ function startHeartbeat() {
 	console.log('[shared-worker] starting heartbeat (every %ds)', HEARTBEAT_MS / 1000)
 	heartbeatInterval = setInterval(() => {
 		console.log('[shared-worker] heartbeat: %d ports', ports.size)
+		const deadPorts = []
 		for (const [port, alive] of ports) {
 			if (!alive) {
-				removePort(port)
+				console.log('[shared-worker] port failed pong, removing')
+				deadPorts.push(port)
 			} else {
 				// reset flag and send next ping
 				ports.set(port, false)
 				try {
 					port.postMessage({ type: 'ping' })
-				} catch {
+				} catch (err) {
 					// postMessage can throw if port is neutered
-					removePort(port)
+					console.warn('[shared-worker] failed to send ping to port:', err)
+					deadPorts.push(port)
 				}
 			}
+		}
+		// Remove dead ports after iteration
+		for (const port of deadPorts) {
+			removePort(port)
 		}
 	}, HEARTBEAT_MS)
 }
