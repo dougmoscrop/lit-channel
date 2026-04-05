@@ -1,6 +1,6 @@
 {
   "name": "lit-channel",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "main": "./src/lit-channel.js",
   "exports": {
@@ -34,10 +34,15 @@
     "playwright": "^1.58.2",
     "ws": "^8.19.0"
   },
-  "keywords": ["lit", "web components", "pub-sub", "websocket"],
+  "keywords": [
+    "lit",
+    "web components",
+    "pub-sub",
+    "websocket"
+  ],
   "repository": {
-	"type": "git",
-	"url": "https://github.com/dougmoscrop/lit-channel.git"
+    "type": "git",
+    "url": "https://github.com/dougmoscrop/lit-channel.git"
   },
   "author": "Doug Moscrop <doug.moscrop@gmail.com>",
   "license": "MIT",
