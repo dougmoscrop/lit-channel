@@ -1,6 +1,6 @@
 {
   "name": "lit-channel",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "main": "./src/lit-channel.js",
   "exports": {
