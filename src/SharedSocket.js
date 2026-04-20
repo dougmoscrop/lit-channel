@@ -14,6 +14,7 @@
  */
 
 const sharedWorkerUrl = new URL('./shared-worker.js', import.meta.url)
+const bcTransportUrl = new URL('./bc-transport.js', import.meta.url)
 
 export function getConfiguredEndpoint(doc = document) {
 	if (!doc?.head) return undefined
@@ -93,7 +94,7 @@ export class SharedSocket {
 		// 1. Try SharedWorker
 		if ('SharedWorker' in window) {
 			try {
-				const worker = new SharedWorker(new URL(sharedWorkerUrl), {
+				const worker = new SharedWorker(sharedWorkerUrl, {
 					type: 'module',
 					name: 'lit-channel',
 				})
@@ -115,7 +116,7 @@ export class SharedSocket {
 
 		// 2. Fallback: BroadcastChannel + leader election
 		try {
-			const { createBroadcastTransport } = await import('./bc-transport.js')
+			const { createBroadcastTransport } = await import(bcTransportUrl.toString())
 			this.#port = createBroadcastTransport({ endpoint })
 			this.#port.start()
 

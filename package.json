@@ -4,13 +4,14 @@
   "type": "module",
   "main": "./src/lit-channel.js",
   "exports": {
-    ".": "./src/lit-channel.js",
-    "./lit-channel.js": "./src/lit-channel.js"
+    ".": "./dist/lit-channel.js",
+    "./lit-channel.js": "./dist/lit-channel.js"
   },
   "scripts": {
     "lint": "eslint . --fix",
     "start": "web-dev-server --open",
-    "build": "rollup -c",
+	"prepack": "npm run build",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && rollup -c",
     "test": "wtr",
     "test:watch": "wtr --watch",
     "test:e2e": "playwright test"
@@ -42,7 +43,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/dougmoscrop/lit-channel.git"
+    "url": "git+https://github.com/dougmoscrop/lit-channel.git"
   },
   "author": "Doug Moscrop <doug.moscrop@gmail.com>",
   "license": "MIT",

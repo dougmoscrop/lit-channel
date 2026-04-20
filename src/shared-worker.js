@@ -1,5 +1,3 @@
-console.log('[shared-worker] loaded!!!!')
-
 /** @type {Map<MessagePort, boolean>} port → alive flag (set true on pong) */
 const ports = new Map()
 /** topic → Set<MessagePort> */

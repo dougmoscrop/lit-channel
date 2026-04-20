@@ -1,9 +1,9 @@
 dev/
 test/
-dist/
 *.config.js
 jsconfig.json
 index.html
 .editorconfig
 .github/
 *.md
+src/
