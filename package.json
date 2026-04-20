@@ -1,6 +1,6 @@
 {
   "name": "lit-channel",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "./src/lit-channel.js",
   "exports": {
@@ -10,7 +10,7 @@
   "scripts": {
     "lint": "eslint . --fix",
     "start": "web-dev-server --open",
-	"prepack": "npm run build",
+    "prepack": "npm run build",
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && rollup -c",
     "test": "wtr",
     "test:watch": "wtr --watch",
