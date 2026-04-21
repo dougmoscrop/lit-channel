@@ -22,6 +22,13 @@ export function getConfiguredEndpoint(doc = document) {
 	return endpoint || undefined
 }
 
+export function getConfiguredWorkerUrl(doc = document) {
+	if (!doc?.head) return undefined
+	const workerMeta = doc.head.querySelector('meta[name="lit-channel-worker-url"]')
+	const workerUrl = workerMeta?.getAttribute('content')?.trim()
+	return workerUrl || undefined
+}
+
 export function resolveWebSocketUrl(endpoint, locationLike = location) {
 	const defaultUrl = `${locationLike.protocol === 'https:' ? 'wss:' : 'ws:'}//${locationLike.host}/api/ws`
 	if (!endpoint) return defaultUrl
@@ -38,9 +45,23 @@ export function resolveWebSocketUrl(endpoint, locationLike = location) {
 	throw new Error(`Invalid lit-channel endpoint protocol: ${resolved.protocol}`)
 }
 
+export function resolveWorkerUrl(workerUrl, locationLike = location, defaultUrl = sharedWorkerUrl) {
+	if (!workerUrl) return defaultUrl.toString()
+
+	const resolved = new URL(workerUrl, locationLike.href)
+	if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+		return resolved.toString()
+	}
+
+	throw new Error(`Invalid lit-channel worker URL protocol: ${resolved.protocol}`)
+}
+
 export class SharedSocket {
 	/** @type {string | undefined} */
 	#endpoint
+
+	/** @type {string | undefined} */
+	#workerUrl
 
 	/** @type {any[]} */
 	#queuedMessages = []
@@ -53,6 +74,14 @@ export class SharedSocket {
 
 	/** @type {Function | null} */
 	#messageHandler = null
+
+	/** @type {string | null} */
+	#inlineWorkerBlobUrl = null
+
+	/** @type {(event: MessageEvent) => void} */
+	#portMessageListener = () => {
+		this.#reconnectAttempts = 0
+	}
 
 	/** @type {EventTarget} */
 	#eventTarget = new EventTarget()
@@ -67,10 +96,11 @@ export class SharedSocket {
 	#reconnectController = null
 
 	/**
-	 * @param {{ endpoint?: string }} [options]
+	 * @param {{ endpoint?: string, workerUrl?: string }} [options]
 	 */
 	constructor(options = {}) {
 		this.#endpoint = options.endpoint ?? getConfiguredEndpoint()
+		this.#workerUrl = options.workerUrl ?? getConfiguredWorkerUrl()
 	}
 
 	/**
@@ -92,8 +122,11 @@ export class SharedSocket {
 
 		// 1. Try SharedWorker
 		if ('SharedWorker' in window) {
+			const workerUrl = resolveWorkerUrl(this.#workerUrl, window.location)
+
 			try {
-				const worker = new SharedWorker(sharedWorkerUrl, {
+				const workerSource = await this.#resolveSharedWorkerSource(workerUrl)
+				const worker = new SharedWorker(workerSource, {
 					type: 'module',
 					name: 'lit-channel',
 				})
@@ -109,6 +142,7 @@ export class SharedSocket {
 				this.#emitEvent('ready')
 				return
 			} catch (error) {
+				this.#clearInlineWorkerBlobUrl()
 				console.warn('[SharedSocket] SharedWorker failed, falling back', error)
 			}
 		}
@@ -131,14 +165,54 @@ export class SharedSocket {
 		}
 	}
 
+	#clearInlineWorkerBlobUrl() {
+		if (!this.#inlineWorkerBlobUrl) return
+		if (typeof URL.revokeObjectURL === 'function') {
+			URL.revokeObjectURL(this.#inlineWorkerBlobUrl)
+		}
+		this.#inlineWorkerBlobUrl = null
+	}
+
+	#shouldUseDataWorkerUrl() {
+		const userAgent = window.navigator?.userAgent?.toLowerCase() ?? ''
+		return userAgent.includes('firefox')
+	}
+
+	async #resolveSharedWorkerSource(workerUrl) {
+		const resolvedWorkerUrl = new URL(workerUrl, window.location.href)
+		if (resolvedWorkerUrl.origin === window.location.origin) {
+			return resolvedWorkerUrl.toString()
+		}
+
+		const response = await fetch(resolvedWorkerUrl.toString())
+		if (!response.ok) {
+			throw new Error(`Worker fetch failed (${response.status})`)
+		}
+
+		const source = await response.text()
+		if (this.#shouldUseDataWorkerUrl()) {
+			return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
+		}
+
+		if (typeof URL.createObjectURL === 'function') {
+			this.#clearInlineWorkerBlobUrl()
+			this.#inlineWorkerBlobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
+			return this.#inlineWorkerBlobUrl
+		}
+
+		return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
+	}
+
 	#setupPortMonitoring() {
 		if (!this.#port) return
 
-		// Keep a stable wrapper so reconnections preserve the app-level handler.
-		this.#port.onmessage = (event) => {
-			// Reset reconnect counter on any successful message
-			this.#reconnectAttempts = 0
-			this.#messageHandler?.(event)
+		this.#port.onmessage = this.#messageHandler
+
+		if (typeof this.#port.removeEventListener === 'function') {
+			this.#port.removeEventListener('message', this.#portMessageListener)
+		}
+		if (typeof this.#port.addEventListener === 'function') {
+			this.#port.addEventListener('message', this.#portMessageListener)
 		}
 	}
 
@@ -284,5 +358,6 @@ export class SharedSocket {
 		this.#port = null
 		this.#queuedMessages = []
 		this.#initPromise = null
+		this.#clearInlineWorkerBlobUrl()
 	}
 }

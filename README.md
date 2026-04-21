@@ -13,6 +13,14 @@ This will establish a single connection to a WebSocket endpoint, defaulting to /
 </head>
 ```
 
+If the bundled shared worker is served from a CDN, you can override just the worker script URL so the page loads it from the app origin instead:
+
+```html
+<head>
+  <meta name="lit-channel-worker-url" content="/assets/lit-channel/shared-worker.js" />
+</head>
+```
+
 Using this element requires the `@web/rollup-plugin-import-meta-assets` in your build
 
 ## Development

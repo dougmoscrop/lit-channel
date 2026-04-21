@@ -2,6 +2,8 @@ import { expect } from '@esm-bundle/chai'
 import {
 	SharedSocket,
 	getConfiguredEndpoint,
+	getConfiguredWorkerUrl,
+	resolveWorkerUrl,
 	resolveWebSocketUrl,
 } from '../../src/SharedSocket.js'
 
@@ -18,16 +20,23 @@ describe('SharedSocket core behavior', () => {
 
 	it('should return undefined when endpoint meta is missing or blank', () => {
 		expect(getConfiguredEndpoint(/** @type {any} */ ({}))).to.equal(undefined)
+		expect(getConfiguredWorkerUrl(/** @type {any} */ ({}))).to.equal(undefined)
 
 		const meta = document.createElement('meta')
 		meta.setAttribute('name', 'lit-channel-endpoint')
 		meta.setAttribute('content', '   ')
+		const workerMeta = document.createElement('meta')
+		workerMeta.setAttribute('name', 'lit-channel-worker-url')
+		workerMeta.setAttribute('content', '   ')
 		document.head.appendChild(meta)
+		document.head.appendChild(workerMeta)
 
 		try {
 			expect(getConfiguredEndpoint(document)).to.equal(undefined)
+			expect(getConfiguredWorkerUrl(document)).to.equal(undefined)
 		} finally {
 			meta.remove()
+			workerMeta.remove()
 		}
 	})
 
@@ -56,6 +65,185 @@ describe('SharedSocket core behavior', () => {
 		expect(() => resolveWebSocketUrl('ftp://example.com/socket', locationLike)).to.throw(
 			'Invalid lit-channel endpoint protocol: ftp:'
 		)
+	})
+
+	it('should resolve default worker URL and allow same-origin overrides', () => {
+		const locationLike = /** @type {Location} */ (/** @type {unknown} */ ({
+			protocol: 'https:',
+			host: 'example.com',
+			href: 'https://example.com/app/index.html',
+		}))
+
+		expect(resolveWorkerUrl(undefined, locationLike)).to.match(/\/shared-worker\.js$/)
+		expect(resolveWorkerUrl('/worker/shared-worker.js', locationLike))
+			.to.equal('https://example.com/worker/shared-worker.js')
+		expect(resolveWorkerUrl('https://example.com/proxy/shared-worker.js', locationLike))
+			.to.equal('https://example.com/proxy/shared-worker.js')
+	})
+
+	it('should reject unsupported worker URL protocols', () => {
+		const locationLike = /** @type {Location} */ (/** @type {unknown} */ ({
+			protocol: 'https:',
+			host: 'example.com',
+			href: 'https://example.com/app/index.html',
+		}))
+
+		expect(() => resolveWorkerUrl('data:text/javascript,self.onconnect=()=>{}', locationLike)).to.throw(
+			'Invalid lit-channel worker URL protocol: data:'
+		)
+	})
+
+	it('should pass configured worker URL to SharedWorker', async () => {
+		const constructedUrls = []
+
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor(url) {
+				constructedUrls.push(url)
+				this.port = {
+					onmessage: null,
+					start() {},
+					postMessage() {},
+					close() {},
+				}
+			}
+		})
+
+		const socket = new SharedSocket({ workerUrl: '/worker/shared-worker.js' })
+		try {
+			await socket.connect()
+			expect(constructedUrls).to.deep.equal([
+				`${window.location.protocol}//${window.location.host}/worker/shared-worker.js`,
+			])
+		} finally {
+			await socket.close()
+		}
+	})
+
+	it('should pass same-origin worker URL to SharedWorker without fetching', async () => {
+		const constructedUrls = []
+		const originalFetch = window.fetch
+		let fetchCalled = false
+
+		window.fetch = /** @type {any} */ (async () => {
+			fetchCalled = true
+			return {
+				ok: true,
+				text: async () => '',
+			}
+		})
+
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor(url) {
+				constructedUrls.push(url)
+				this.port = {
+					onmessage: null,
+					start() {},
+					postMessage() {},
+					close() {},
+				}
+			}
+		})
+
+		const sameOriginWorkerUrl = `${window.location.protocol}//${window.location.host}/worker/same-origin.js`
+		const socket = new SharedSocket({ workerUrl: sameOriginWorkerUrl })
+		try {
+			await socket.connect()
+			expect(constructedUrls).to.deep.equal([sameOriginWorkerUrl])
+			expect(fetchCalled).to.equal(false)
+		} finally {
+			await socket.close()
+			window.fetch = originalFetch
+		}
+	})
+
+	it('should inline cross-origin worker URL before constructing SharedWorker', async () => {
+		const constructedUrls = []
+		const originalFetch = window.fetch
+		const fetchedUrls = []
+
+		window.fetch = /** @type {any} */ (async (url) => {
+			fetchedUrls.push(url)
+			return {
+				ok: true,
+				text: async () => 'self.onconnect = () => {}',
+			}
+		})
+
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor(url) {
+				constructedUrls.push(url)
+				this.port = {
+					onmessage: null,
+					start() {},
+					postMessage() {},
+					close() {},
+				}
+			}
+		})
+
+		const crossOriginUrl = 'https://cdn.example.com/lit-channel/shared-worker.js'
+		const socket = new SharedSocket({ workerUrl: crossOriginUrl })
+		try {
+			await socket.connect()
+			expect(fetchedUrls).to.deep.equal([crossOriginUrl])
+			expect(constructedUrls).to.have.lengthOf(1)
+			expect(
+				constructedUrls[0].startsWith('blob:') || constructedUrls[0].startsWith('data:')
+			).to.equal(true)
+		} finally {
+			await socket.close()
+			window.fetch = originalFetch
+		}
+	})
+
+	it('should fall back to broadcast channel when cross-origin worker fetch fails', async () => {
+		const originalFetch = window.fetch
+		const originalBroadcastChannel = window.BroadcastChannel
+		const originalWebSocket = window.WebSocket
+		window.fetch = /** @type {any} */ (async () => ({
+			ok: false,
+			status: 503,
+			text: async () => '',
+		}))
+
+		let fallbackUsed = false
+		const socket = new SharedSocket({ workerUrl: 'https://cdn.example.com/lit-channel/shared-worker.js' })
+		try {
+			window.SharedWorker = /** @type {any} */ (class {
+				constructor() {
+					throw new Error('SharedWorker should not be constructed when fetch fails')
+				}
+			})
+
+			window.BroadcastChannel = /** @type {any} */ (class {
+				constructor() {}
+				postMessage() {}
+				addEventListener() {}
+				removeEventListener() {}
+				close() { fallbackUsed = true }
+			})
+			window.WebSocket = /** @type {any} */ (class {
+				constructor() {
+					this.readyState = 1
+					this.onopen = null
+					this.onmessage = null
+					this.onclose = null
+					this.onerror = null
+					setTimeout(() => this.onopen?.(), 0)
+				}
+				send() {}
+				close() {}
+			})
+
+			await socket.connect()
+			expect(socket.isReady).to.equal(true)
+			await socket.close()
+			expect(fallbackUsed).to.equal(true)
+		} finally {
+			window.fetch = originalFetch
+			window.BroadcastChannel = originalBroadcastChannel
+			window.WebSocket = originalWebSocket
+		}
 	})
 
 	it('should de-duplicate concurrent connect calls', async () => {
