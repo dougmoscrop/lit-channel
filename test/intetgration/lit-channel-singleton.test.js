@@ -1,6 +1,6 @@
 import { expect } from '@esm-bundle/chai'
 import { html, fixture } from '@open-wc/testing'
-import { __resetConnectionForTests } from '../../src/lit-channel.js'
+import { __resetConnectionForTests, configureLitChannel } from '../../src/lit-channel.js'
 import '../../src/lit-channel.js'
 
 async function waitForBridge(element, timeoutMs = 2000) {
@@ -148,6 +148,46 @@ describe('lit-channel singleton and lifecycle', () => {
 			expect(sendCount).to.equal(0)
 		} finally {
 			console.warn = originalWarn
+		}
+	})
+
+	it('should apply configured resume options to lit-channel subscriptions', async () => {
+		const postedMessages = []
+
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor() {
+				this.port = {
+					onmessage: null,
+					start() {},
+					postMessage(msg) { postedMessages.push(msg) },
+					close() {},
+				}
+			}
+		})
+
+		configureLitChannel({
+			resumeEnabled: true,
+			sessionId: 'element-session',
+			getResumeCursor(topic) {
+				return topic === 'ResumeTopic'
+					? { streamSeq: 21, cursor: 'cursor-21' }
+					: undefined
+			},
+		})
+
+		const element = /** @type {any} */ (await fixture(html`<lit-channel name="ResumeTopic"></lit-channel>`))
+
+		try {
+			await waitForBridge(element)
+
+			expect(element._bridge.sessionId).to.equal('element-session')
+			expect(postedMessages).to.deep.include({
+				type: 'subscribe',
+				topic: 'ResumeTopic',
+				resume: { streamSeq: 21, cursor: 'cursor-21', sessionId: 'element-session' },
+			})
+		} finally {
+			element.remove()
 		}
 	})
 })

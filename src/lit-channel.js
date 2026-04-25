@@ -2,19 +2,55 @@ import { LitElement, html } from 'lit'
 import { SharedSocket } from './SharedSocket.js'
 import { PubSubBridge } from './PubSubBridge.js'
 
+/**
+ * @typedef {Object} LitChannelConfig
+ * @property {string} [endpoint]
+ * @property {string} [workerUrl]
+ * @property {string} [authToken]
+ * @property {boolean} [resumeEnabled]
+ * @property {string} [sessionId]
+ * @property {(topic: string) => any} [getResumeCursor]
+ * @property {number} [eventIdDedupeLimit]
+ */
+
 // Singleton instances shared across all lit-channel elements
 let sharedSocket = null
 let pubSubBridge = null
 let connectionPromise = null
+/** @type {LitChannelConfig} */
+let litChannelConfig = {}
 
+export { SharedSocket } from './SharedSocket.js'
+export { PubSubBridge } from './PubSubBridge.js'
+
+/**
+ * Configure the singleton used by `<lit-channel>` elements.
+ * Call before any element connects.
+ * @param {LitChannelConfig} [config]
+ */
+export function configureLitChannel(config = {}) {
+	if (sharedSocket || connectionPromise) {
+		throw new Error('configureLitChannel must be called before lit-channel connects')
+	}
+	litChannelConfig = { ...litChannelConfig, ...config }
+}
+
+/**
+ * @param {LitChannelConfig} [config]
+ */
 async function getConnection(config = {}) {
 	if (connectionPromise) return connectionPromise
+	const effectiveConfig = { ...litChannelConfig, ...config }
 
 	connectionPromise = (async () => {
 		if (!sharedSocket) {
-			sharedSocket = new SharedSocket(config)
+			sharedSocket = new SharedSocket({
+				endpoint: effectiveConfig.endpoint,
+				workerUrl: effectiveConfig.workerUrl,
+				authToken: effectiveConfig.authToken,
+			})
 			await sharedSocket.connect()
-			pubSubBridge = new PubSubBridge(sharedSocket)
+			pubSubBridge = new PubSubBridge(sharedSocket, effectiveConfig)
 		}
 		return pubSubBridge
 	})()
@@ -27,6 +63,7 @@ export async function __resetConnectionForTests() {
 	sharedSocket = null
 	pubSubBridge = null
 	connectionPromise = null
+	litChannelConfig = {}
 }
 
 /**

@@ -168,6 +168,99 @@ describe('BroadcastChannel transport resilience', () => {
 		}
 	})
 
+	it('should forward resume subscribe and ack frames in BroadcastChannel fallback', async () => {
+		const FakeWebSocket = createFakeWebSocketClass()
+
+		window.SharedWorker = undefined
+		window.WebSocket = /** @type {any} */ (FakeWebSocket)
+
+		const socket = new SharedSocket()
+		try {
+			await socket.connect()
+			await waitFor(() => FakeWebSocket.instances.length >= 1)
+
+			const bridge = new PubSubBridge(socket, {
+				resumeEnabled: true,
+				sessionId: 'bc-session',
+				getResumeCursor(topic) {
+					return topic === 'bc-resume-topic'
+						? { streamSeq: 5, cursor: 'cursor-5' }
+						: undefined
+				},
+			})
+			bridge.subscribe('bc-resume-topic', () => {})
+
+			const ws = FakeWebSocket.instances[0]
+			ws.emitOpen()
+
+			const openMessages = ws.sent.map((raw) => JSON.parse(raw))
+			expect(openMessages).to.deep.include({
+				type: 'subscribe',
+				topic: 'bc-resume-topic',
+				resume: { streamSeq: 5, cursor: 'cursor-5', sessionId: 'bc-session' },
+			})
+
+			ws.sent.length = 0
+			ws.emit('message', {
+				data: JSON.stringify({
+					type: 'message',
+					topic: 'bc-resume-topic',
+					payload: { __rt: { streamSeq: 6, eventId: 'bc-event-6' } },
+				}),
+			})
+
+			const ackMessages = ws.sent.map((raw) => JSON.parse(raw))
+			expect(ackMessages).to.deep.equal([
+				{ type: 'ack', topic: 'bc-resume-topic', streamSeq: 6, cursor: '6', sessionId: 'bc-session' },
+			])
+		} finally {
+			await socket.close()
+		}
+	})
+
+	it('should replay resume cursor when BroadcastChannel websocket reconnects', async () => {
+		const FakeWebSocket = createFakeWebSocketClass()
+
+		window.SharedWorker = undefined
+		window.WebSocket = /** @type {any} */ (FakeWebSocket)
+		window.setTimeout = /** @type {any} */ ((fn, _delay, ...args) => {
+			return OriginalSetTimeout(() => fn(...args), 0)
+		})
+
+		const socket = new SharedSocket()
+		try {
+			await socket.connect()
+			await waitFor(() => FakeWebSocket.instances.length >= 1)
+
+			const bridge = new PubSubBridge(socket, { resumeEnabled: true, sessionId: 'bc-reconnect-session' })
+			bridge.subscribe('bc-reconnect-topic', () => {})
+
+			const firstWs = FakeWebSocket.instances[0]
+			firstWs.emitOpen()
+			firstWs.emit('message', {
+				data: JSON.stringify({
+					type: 'message',
+					topic: 'bc-reconnect-topic',
+					payload: { __rt: { streamSeq: 9 } },
+				}),
+			})
+
+			firstWs.emit('close')
+			await waitFor(() => FakeWebSocket.instances.length >= 2)
+
+			const secondWs = FakeWebSocket.instances[1]
+			secondWs.emitOpen()
+			const secondOpenMessages = secondWs.sent.map((raw) => JSON.parse(raw))
+			expect(secondOpenMessages).to.deep.include({
+				type: 'subscribe',
+				topic: 'bc-reconnect-topic',
+				resume: { streamSeq: 9, cursor: '9', sessionId: 'bc-reconnect-session' },
+			})
+		} finally {
+			await socket.close()
+		}
+	})
+
 	it('should pass bearer token to websocket in BroadcastChannel fallback', async () => {
 		const FakeWebSocket = createFakeWebSocketClass()
 

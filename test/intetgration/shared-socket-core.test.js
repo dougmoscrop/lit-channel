@@ -7,6 +7,7 @@ import {
 	resolveWorkerUrl,
 	resolveWebSocketUrl,
 } from '../../src/SharedSocket.js'
+import { PubSubBridge } from '../../src/PubSubBridge.js'
 
 describe('SharedSocket core behavior', () => {
 	let OriginalSharedWorker
@@ -342,6 +343,60 @@ describe('SharedSocket core behavior', () => {
 			expect(capturedPort).to.not.equal(null)
 			const port = /** @type {any} */ (capturedPort)
 			expect(port.onmessage).to.equal(handler)
+		} finally {
+			await socket.close()
+		}
+	})
+
+	it('should forward resume subscribe and ack frames through SharedWorker port', async () => {
+		const postedMessages = []
+		let capturedPort = null
+
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor() {
+				capturedPort = {
+					onmessage: null,
+					start() {},
+					postMessage(message) { postedMessages.push(message) },
+					close() {},
+				}
+				this.port = capturedPort
+			}
+		})
+
+		const socket = new SharedSocket({ endpoint: '/shared-worker-resume/ws' })
+		try {
+			await socket.connect()
+			const bridge = new PubSubBridge(socket, {
+				resumeEnabled: true,
+				sessionId: 'sw-session',
+				getResumeCursor(topic) {
+					return topic === 'sw-resume-topic'
+						? { streamSeq: 2, cursor: 'cursor-2' }
+						: undefined
+				},
+			})
+
+			bridge.subscribe('sw-resume-topic', () => {})
+
+			expect(postedMessages).to.deep.include({
+				type: 'subscribe',
+				topic: 'sw-resume-topic',
+				resume: { streamSeq: 2, cursor: 'cursor-2', sessionId: 'sw-session' },
+			})
+
+			postedMessages.length = 0
+			;(/** @type {any} */ (capturedPort)).onmessage?.({
+				data: {
+					type: 'message',
+					topic: 'sw-resume-topic',
+					payload: { __rt: { streamSeq: 3, eventId: 'sw-event-3' } },
+				},
+			})
+
+			expect(postedMessages).to.deep.equal([
+				{ type: 'ack', topic: 'sw-resume-topic', streamSeq: 3, cursor: '3', sessionId: 'sw-session' },
+			])
 		} finally {
 			await socket.close()
 		}

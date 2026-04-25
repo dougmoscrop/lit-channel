@@ -1,12 +1,19 @@
 {
   "name": "lit-channel",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "type": "module",
   "main": "./src/lit-channel.js",
   "exports": {
     ".": "./dist/lit-channel.js",
     "./lit-channel.js": "./dist/lit-channel.js"
   },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "lint": "eslint . --fix",
     "start": "web-dev-server --open",

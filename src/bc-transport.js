@@ -35,15 +35,56 @@ export function createBroadcastTransport(options = {}) {
 	let pingTimer = null
 	let wsHealthCheckInterval = null
 	let wsHealthCheckMissCount = 0
-    const pendingWsMessages = []
+	const pendingWsMessages = []
 
 	/** ALL locally-subscribed topics (tracked regardless of leader status) */
 	const localTopics = new Set()
-	/** topics the server-side WS is subscribed to (managed by leader only) */
+	/** topics this tab believes the server-side WS should be subscribed to */
 	const wsSubscribedTopics = new Set()
+	/** topic → latest resume cursor observed from subscribe/ack frames */
+	const topicResume = new Map()
 
 	/** The consumer sets this — same shape as MessagePort.onmessage */
 	let _onmessage = null
+
+	function normalizeStreamSeq(value) {
+		const streamSeq = typeof value === 'number'
+			? value
+			: typeof value === 'string' && value.trim() !== ''
+				? Number(value)
+				: NaN
+
+		if (!Number.isSafeInteger(streamSeq) || streamSeq < 0) return undefined
+		return streamSeq
+	}
+
+	function updateTopicResume(topic, value) {
+		if (!topic || !value || typeof value !== 'object') return false
+		const streamSeq = normalizeStreamSeq(value.streamSeq)
+		if (streamSeq === undefined) return false
+
+		const current = topicResume.get(topic)
+		if (current && streamSeq <= current.streamSeq) return false
+
+		const cursor = value.cursor === undefined || value.cursor === null
+			? String(streamSeq)
+			: String(value.cursor)
+		const sessionId = value.sessionId === undefined || value.sessionId === null
+			? undefined
+			: String(value.sessionId)
+
+		topicResume.set(topic, { streamSeq, cursor, sessionId })
+		return true
+	}
+
+	function buildSubscribeFrame(topic) {
+		const frame = { type: 'subscribe', topic }
+		const resume = topicResume.get(topic)
+		if (resume) {
+			frame.resume = { ...resume }
+		}
+		return frame
+	}
 
 	// ---- WebSocket (leader only) ----
 
@@ -112,7 +153,7 @@ export function createBroadcastTransport(options = {}) {
 			startWsHealthCheck()
 
 			for (const topic of wsSubscribedTopics) {
-				ws.send(JSON.stringify({ type: 'subscribe', topic }))
+				ws.send(JSON.stringify(buildSubscribeFrame(topic)))
 			}
 
 			if (pendingWsMessages.length > 0) {
@@ -222,17 +263,29 @@ export function createBroadcastTransport(options = {}) {
 				break
 
 			case 'subscribe':
-				if (isLeader && !wsSubscribedTopics.has(msg.topic)) {
+				{
+					const didAdvance = updateTopicResume(msg.topic, msg.resume)
+					const shouldSubscribe = !wsSubscribedTopics.has(msg.topic)
 					wsSubscribedTopics.add(msg.topic)
-					wsSend({ type: 'subscribe', topic: msg.topic })
+					if (isLeader && (shouldSubscribe || didAdvance)) {
+						wsSend(buildSubscribeFrame(msg.topic))
+					}
+				}
+				break
+
+			case 'ack':
+				updateTopicResume(msg.topic, msg)
+				if (isLeader) {
+					wsSend(msg)
 				}
 				break
 
 			case 'unsubscribe':
 				if (isLeader && wsSubscribedTopics.has(msg.topic)) {
-					wsSubscribedTopics.delete(msg.topic)
 					wsSend({ type: 'unsubscribe', topic: msg.topic })
 				}
+				wsSubscribedTopics.delete(msg.topic)
+				topicResume.delete(msg.topic)
 				break
 		}
 	}
@@ -242,7 +295,7 @@ export function createBroadcastTransport(options = {}) {
 	return {
 		/**
 		 * Mirror of MessagePort.postMessage
-		 * @param {{ type: any; topic: any; payload: any; }} msg
+		 * @param {{ type: any; topic: any; payload?: any; resume?: any; streamSeq?: any; cursor?: any; sessionId?: any; }} msg
 		 */
 		postMessage(msg) {
 			const { type, topic, payload } = msg
@@ -250,11 +303,26 @@ export function createBroadcastTransport(options = {}) {
 			switch (type) {
 				case 'subscribe':
 					localTopics.add(topic)
-					if (isLeader) {
+					{
+						const didAdvance = updateTopicResume(topic, msg.resume)
+						const shouldSubscribe = !wsSubscribedTopics.has(topic)
 						wsSubscribedTopics.add(topic)
-						wsSend({ type: 'subscribe', topic })
+						if (isLeader) {
+							if (shouldSubscribe || didAdvance) {
+								wsSend(buildSubscribeFrame(topic))
+							}
+						} else {
+							bc.postMessage(msg)
+						}
+					}
+					break
+
+				case 'ack':
+					updateTopicResume(topic, msg)
+					if (isLeader) {
+						wsSend(msg)
 					} else {
-						bc.postMessage({ type: 'subscribe', topic })
+						bc.postMessage(msg)
 					}
 					break
 
@@ -262,6 +330,7 @@ export function createBroadcastTransport(options = {}) {
 					localTopics.delete(topic)
 					if (isLeader) {
 						wsSubscribedTopics.delete(topic)
+						topicResume.delete(topic)
 						wsSend({ type: 'unsubscribe', topic })
 					} else {
 						bc.postMessage({ type: 'unsubscribe', topic })

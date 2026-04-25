@@ -2,6 +2,8 @@
 const ports = new Map()
 /** topic → Set<MessagePort> */
 const topicPorts = new Map()
+/** topic → latest resume cursor known to the worker */
+const topicResume = new Map()
 
 let ws
 let reconnectTimer
@@ -19,6 +21,45 @@ const HEARTBEAT_MS = 30000
 const WS_PING_INTERVAL_MS = 30000
 const WS_PONG_TIMEOUT_MS = 10000
 const WS_HEALTH_CHECK_MAX_MISSES = 3
+
+function normalizeStreamSeq(value) {
+	const streamSeq = typeof value === 'number'
+		? value
+		: typeof value === 'string' && value.trim() !== ''
+			? Number(value)
+			: NaN
+
+	if (!Number.isSafeInteger(streamSeq) || streamSeq < 0) return undefined
+	return streamSeq
+}
+
+function updateTopicResume(topic, value) {
+	if (!topic || !value || typeof value !== 'object') return false
+	const streamSeq = normalizeStreamSeq(value.streamSeq)
+	if (streamSeq === undefined) return false
+
+	const current = topicResume.get(topic)
+	if (current && streamSeq <= current.streamSeq) return false
+
+	const cursor = value.cursor === undefined || value.cursor === null
+		? String(streamSeq)
+		: String(value.cursor)
+	const sessionId = value.sessionId === undefined || value.sessionId === null
+		? undefined
+		: String(value.sessionId)
+
+	topicResume.set(topic, { streamSeq, cursor, sessionId })
+	return true
+}
+
+function buildSubscribeFrame(topic) {
+	const frame = { type: 'subscribe', topic }
+	const resume = topicResume.get(topic)
+	if (resume) {
+		frame.resume = { ...resume }
+	}
+	return frame
+}
 
 // ---------- WebSocket ----------
 
@@ -85,7 +126,7 @@ function connectWebSocket() {
 		lastWsInboundAt = Date.now()
 		startWsHealthCheck()
 		for (const topic of topicPorts.keys()) {
-			ws.send(JSON.stringify({ type: 'subscribe', topic }))
+			ws.send(JSON.stringify(buildSubscribeFrame(topic)))
 		}
 		// Flush any queued outbound messages that were published while reconnecting.
 		if (pendingWsMessages.length > 0) {
@@ -148,7 +189,7 @@ function send(data) {
 
 	// Queue outbound operations during reconnect windows so transient outages
 	// do not drop short-lived signals like typing indicators.
-	if (data?.type === 'publish' || data?.type === 'subscribe' || data?.type === 'unsubscribe' || data?.type === 'ping' || data?.type === 'pong') {
+	if (data?.type === 'publish' || data?.type === 'subscribe' || data?.type === 'unsubscribe' || data?.type === 'ack' || data?.type === 'ping' || data?.type === 'pong') {
 		pendingWsMessages.push(data)
 		// Keep queue bounded to avoid unbounded growth under prolonged disconnects.
 		if (pendingWsMessages.length > 512) pendingWsMessages.shift()
@@ -196,10 +237,13 @@ function handlePortMessage(port, msg) {
 			break
 		}
 		case 'subscribe': {
+			const didAdvance = updateTopicResume(topic, msg.resume)
 			if (!topicPorts.has(topic)) {
 				topicPorts.set(topic, new Set())
 				// first local subscriber → tell the server
-				send({ type: 'subscribe', topic })
+				send(buildSubscribeFrame(topic))
+			} else if (didAdvance) {
+				send(buildSubscribeFrame(topic))
 			}
 			topicPorts.get(topic).add(port)
 			break
@@ -210,10 +254,16 @@ function handlePortMessage(port, msg) {
 				subs.delete(port)
 				if (subs.size === 0) {
 					topicPorts.delete(topic)
+					topicResume.delete(topic)
 					// last local subscriber → tell the server
 					send({ type: 'unsubscribe', topic })
 				}
 			}
+			break
+		}
+		case 'ack': {
+			updateTopicResume(topic, msg)
+			send(msg)
 			break
 		}
 		case 'publish': {
@@ -230,6 +280,7 @@ function removePort(port) {
 		subs.delete(port)
 		if (subs.size === 0) {
 			topicPorts.delete(topic)
+			topicResume.delete(topic)
 			send({ type: 'unsubscribe', topic })
 		}
 	}
