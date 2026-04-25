@@ -21,6 +21,16 @@ If the bundled shared worker is served from a CDN, you can override just the wor
 </head>
 ```
 
+To pass an optional Bearer token during the WebSocket handshake, provide a token meta tag:
+
+```html
+<head>
+  <meta name="lit-channel-auth-token" content="Bearer YOUR_TOKEN" />
+</head>
+```
+
+The token is normalized (the `Bearer ` prefix is optional) and sent as a WebSocket subprotocol pair: `['bearer', token]`.
+
 Using this element requires the `@web/rollup-plugin-import-meta-assets` in your build
 
 ## Development

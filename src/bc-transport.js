@@ -23,6 +23,7 @@ const LEADER_PING_MAX_MISSES = 3    // Close after 3 consecutive missed pongs
 
 export function createBroadcastTransport(options = {}) {
 	const websocketUrl = options.endpoint ?? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/ws`
+	const authToken = typeof options.authToken === 'string' ? options.authToken.trim() : ''
 	const bc = new BroadcastChannel(BC_NAME)
 	const elector = createLeaderElection(bc)
 
@@ -95,7 +96,11 @@ export function createBroadcastTransport(options = {}) {
 
 	function connectWebSocket() {
 		console.log('[bc-transport] leader connecting WebSocket')
-		ws = new WebSocket(websocketUrl)
+		if (authToken) {
+			ws = new WebSocket(websocketUrl, ['bearer', authToken])
+		} else {
+			ws = new WebSocket(websocketUrl)
+		}
 		lastPongTime = Date.now()
 		lastInboundTime = Date.now()
 		wsHealthCheckMissCount = 0

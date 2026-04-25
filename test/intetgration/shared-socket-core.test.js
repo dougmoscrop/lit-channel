@@ -1,6 +1,7 @@
 import { expect } from '@esm-bundle/chai'
 import {
 	SharedSocket,
+	getConfiguredAuthToken,
 	getConfiguredEndpoint,
 	getConfiguredWorkerUrl,
 	resolveWorkerUrl,
@@ -21,6 +22,7 @@ describe('SharedSocket core behavior', () => {
 	it('should return undefined when endpoint meta is missing or blank', () => {
 		expect(getConfiguredEndpoint(/** @type {any} */ ({}))).to.equal(undefined)
 		expect(getConfiguredWorkerUrl(/** @type {any} */ ({}))).to.equal(undefined)
+		expect(getConfiguredAuthToken(/** @type {any} */ ({}))).to.equal(undefined)
 
 		const meta = document.createElement('meta')
 		meta.setAttribute('name', 'lit-channel-endpoint')
@@ -28,15 +30,21 @@ describe('SharedSocket core behavior', () => {
 		const workerMeta = document.createElement('meta')
 		workerMeta.setAttribute('name', 'lit-channel-worker-url')
 		workerMeta.setAttribute('content', '   ')
+		const authMeta = document.createElement('meta')
+		authMeta.setAttribute('name', 'lit-channel-auth-token')
+		authMeta.setAttribute('content', '   ')
 		document.head.appendChild(meta)
 		document.head.appendChild(workerMeta)
+		document.head.appendChild(authMeta)
 
 		try {
 			expect(getConfiguredEndpoint(document)).to.equal(undefined)
 			expect(getConfiguredWorkerUrl(document)).to.equal(undefined)
+			expect(getConfiguredAuthToken(document)).to.equal(undefined)
 		} finally {
 			meta.remove()
 			workerMeta.remove()
+			authMeta.remove()
 		}
 	})
 
@@ -289,7 +297,7 @@ describe('SharedSocket core behavior', () => {
 			}
 		})
 
-		const socket = new SharedSocket({ endpoint: '/reconnect/ws' })
+		const socket = new SharedSocket({ endpoint: '/reconnect/ws', authToken: 'Bearer reconnect-token' })
 		const queuedMessage = { type: 'publish', topic: 'reconnect-topic', payload: { value: 7 } }
 
 		try {
@@ -302,6 +310,7 @@ describe('SharedSocket core behavior', () => {
 			expect(postedByInstance[1][0]).to.deep.equal({
 				type: 'config',
 				endpoint: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/reconnect/ws`,
+				authToken: 'reconnect-token',
 			})
 			expect(postedByInstance[1][1]).to.deep.equal(queuedMessage)
 		} finally {

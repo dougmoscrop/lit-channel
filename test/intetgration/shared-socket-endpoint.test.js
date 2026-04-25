@@ -1,6 +1,7 @@
 import { expect } from '@esm-bundle/chai'
 import { html, fixture } from '@open-wc/testing'
 import {
+	getConfiguredAuthToken,
 	getConfiguredEndpoint,
 	getConfiguredWorkerUrl,
 	resolveWebSocketUrl,
@@ -10,9 +11,19 @@ import '../../src/lit-channel.js'
 
 describe('Endpoint config', () => {
 	afterEach(async () => {
+		document.head.querySelector('meta[name="lit-channel-auth-token"]')?.remove()
 		document.head.querySelector('meta[name="lit-channel-endpoint"]')?.remove()
 		document.head.querySelector('meta[name="lit-channel-worker-url"]')?.remove()
 		await __resetConnectionForTests()
+	})
+
+	it('should read auth token from head meta', () => {
+		const meta = document.createElement('meta')
+		meta.setAttribute('name', 'lit-channel-auth-token')
+		meta.setAttribute('content', ' Bearer my-token ')
+		document.head.appendChild(meta)
+
+		expect(getConfiguredAuthToken(document)).to.equal('Bearer my-token')
 	})
 
 	it('should read endpoint from head meta', () => {
@@ -59,6 +70,10 @@ describe('Endpoint config', () => {
 		meta.setAttribute('name', 'lit-channel-endpoint')
 		meta.setAttribute('content', '/configured/ws')
 		document.head.appendChild(meta)
+		const authMeta = document.createElement('meta')
+		authMeta.setAttribute('name', 'lit-channel-auth-token')
+		authMeta.setAttribute('content', 'Bearer test-token')
+		document.head.appendChild(authMeta)
 
 		const OriginalSharedWorker = window.SharedWorker
 		const postedMessages = []
@@ -92,6 +107,7 @@ describe('Endpoint config', () => {
 			expect(postedMessages).to.deep.include({
 				type: 'config',
 				endpoint: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/configured/ws`,
+				authToken: 'test-token',
 			})
 		} finally {
 			if (element?.parentElement) {

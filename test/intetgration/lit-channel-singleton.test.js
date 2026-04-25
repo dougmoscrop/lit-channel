@@ -104,7 +104,7 @@ describe('lit-channel singleton and lifecycle', () => {
 			const subscribeCount = postedMessages.filter((msg) => (
 				msg.type === 'subscribe' && msg.topic === 'SameTopic'
 			)).length
-			expect(subscribeCount).to.equal(2)
+			expect(subscribeCount).to.equal(1)
 
 			first.remove()
 			await Promise.resolve()

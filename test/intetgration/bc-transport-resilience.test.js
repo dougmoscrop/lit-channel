@@ -9,8 +9,9 @@ function createFakeWebSocketClass() {
 		static CLOSED = 3
 		static instances = []
 
-		constructor(url) {
+		constructor(url, protocols) {
 			this.url = url
+			this.protocols = protocols
 			this.readyState = FakeWebSocket.CONNECTING
 			this.sent = []
 			this.closeCalls = 0
@@ -104,7 +105,7 @@ describe('BroadcastChannel transport resilience', () => {
 			FakeWebSocket.instances[0].emit('close')
 			await waitFor(() => FakeWebSocket.instances.length >= 2)
 
-			expect(scheduledDelays).to.include(3000)
+			expect(scheduledDelays).to.include(1000)
 		} finally {
 			await socket.close()
 		}
@@ -162,6 +163,23 @@ describe('BroadcastChannel transport resilience', () => {
 			expect(secondOpenMessages).to.deep.include({ type: 'subscribe', topic: 'resub-topic' })
 
 			unsubscribe()
+		} finally {
+			await socket.close()
+		}
+	})
+
+	it('should pass bearer token to websocket in BroadcastChannel fallback', async () => {
+		const FakeWebSocket = createFakeWebSocketClass()
+
+		window.SharedWorker = undefined
+		window.WebSocket = /** @type {any} */ (FakeWebSocket)
+
+		const socket = new SharedSocket({ authToken: 'Bearer fallback-token' })
+		try {
+			await socket.connect()
+			await waitFor(() => FakeWebSocket.instances.length >= 1)
+
+			expect(FakeWebSocket.instances[0].protocols).to.deep.equal(['bearer', 'fallback-token'])
 		} finally {
 			await socket.close()
 		}

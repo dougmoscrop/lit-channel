@@ -19,7 +19,7 @@ describe('SharedSocket queue', () => {
 			}
 		}
 
-		const socket = new SharedSocket({ endpoint: '/queued/ws' })
+		const socket = new SharedSocket({ endpoint: '/queued/ws', authToken: 'Bearer queue-token' })
 		socket.postMessage({ type: 'subscribe', topic: 'before-connect' })
 		socket.postMessage({ type: 'publish', topic: 'before-connect', payload: { value: 42 } })
 
@@ -29,6 +29,7 @@ describe('SharedSocket queue', () => {
 			expect(postedMessages[0]).to.deep.equal({
 				type: 'config',
 				endpoint: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/queued/ws`,
+				authToken: 'queue-token',
 			})
 			expect(postedMessages.slice(1)).to.deep.equal([
 				{ type: 'subscribe', topic: 'before-connect' },

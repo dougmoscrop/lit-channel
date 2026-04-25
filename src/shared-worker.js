@@ -13,6 +13,7 @@ let awaitingWsPong = false
 let wsHealthCheckMissCount = 0
 const pendingWsMessages = []
 let endpoint = `${self.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${self.location.host}/api/ws`
+let authToken = ''
 
 const HEARTBEAT_MS = 30000
 const WS_PING_INTERVAL_MS = 30000
@@ -68,7 +69,11 @@ function stopWsHealthCheck() {
 
 function connectWebSocket() {
 	console.log('[shared-worker] connecting ws...')
-	ws = new WebSocket(endpoint)
+	if (authToken) {
+		ws = new WebSocket(endpoint, ['bearer', authToken])
+	} else {
+		ws = new WebSocket(endpoint)
+	}
 	lastWsPingAt = 0
 	lastWsInboundAt = Date.now()
 	awaitingWsPong = false
@@ -160,11 +165,23 @@ function handlePortMessage(port, msg) {
 
 	switch (type) {
 		case 'config': {
-			if (!nextEndpoint || nextEndpoint === endpoint) {
+			const hasAuthToken = Object.prototype.hasOwnProperty.call(msg, 'authToken')
+			const nextAuthToken = hasAuthToken && typeof msg.authToken === 'string'
+				? msg.authToken.trim()
+				: ''
+			const hasEndpointChange = Boolean(nextEndpoint && nextEndpoint !== endpoint)
+			const hasAuthTokenChange = hasAuthToken && nextAuthToken !== authToken
+
+			if (!hasEndpointChange && !hasAuthTokenChange) {
 				break
 			}
 
-			endpoint = nextEndpoint
+			if (hasEndpointChange) {
+				endpoint = nextEndpoint
+			}
+			if (hasAuthTokenChange) {
+				authToken = nextAuthToken
+			}
 			clearTimeout(reconnectTimer)
 			if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
 				ws.close()

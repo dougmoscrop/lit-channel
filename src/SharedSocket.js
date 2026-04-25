@@ -29,6 +29,19 @@ export function getConfiguredWorkerUrl(doc = document) {
 	return workerUrl || undefined
 }
 
+export function getConfiguredAuthToken(doc = document) {
+	if (!doc?.head) return undefined
+	const authTokenMeta = doc.head.querySelector('meta[name="lit-channel-auth-token"]')
+	const authToken = authTokenMeta?.getAttribute('content')?.trim()
+	return authToken || undefined
+}
+
+function normalizeAuthToken(token) {
+	if (typeof token !== 'string') return undefined
+	const normalized = token.trim().replace(/^Bearer\s+/i, '')
+	return normalized || undefined
+}
+
 export function resolveWebSocketUrl(endpoint, locationLike = location) {
 	const defaultUrl = `${locationLike.protocol === 'https:' ? 'wss:' : 'ws:'}//${locationLike.host}/api/ws`
 	if (!endpoint) return defaultUrl
@@ -63,6 +76,9 @@ export class SharedSocket {
 	/** @type {string | undefined} */
 	#workerUrl
 
+	/** @type {string | undefined} */
+	#authToken
+
 	/** @type {any[]} */
 	#queuedMessages = []
 
@@ -96,11 +112,12 @@ export class SharedSocket {
 	#reconnectController = null
 
 	/**
-	 * @param {{ endpoint?: string, workerUrl?: string }} [options]
+	 * @param {{ endpoint?: string, workerUrl?: string, authToken?: string }} [options]
 	 */
 	constructor(options = {}) {
 		this.#endpoint = options.endpoint ?? getConfiguredEndpoint()
 		this.#workerUrl = options.workerUrl ?? getConfiguredWorkerUrl()
+		this.#authToken = normalizeAuthToken(options.authToken ?? getConfiguredAuthToken())
 	}
 
 	/**
@@ -126,13 +143,17 @@ export class SharedSocket {
 
 			try {
 				const workerSource = await this.#resolveSharedWorkerSource(workerUrl)
+				const configMessage = { type: 'config', endpoint }
+				if (this.#authToken) {
+					configMessage.authToken = this.#authToken
+				}
 				const worker = new SharedWorker(workerSource, {
 					type: 'module',
 					name: 'lit-channel',
 				})
 				this.#port = worker.port
 				this.#port.start()
-				this.#port.postMessage({ type: 'config', endpoint })
+				this.#port.postMessage(configMessage)
 
 				// Set up message handler to detect port disconnection
 				this.#setupPortMonitoring()
@@ -150,7 +171,7 @@ export class SharedSocket {
 		// 2. Fallback: BroadcastChannel + leader election
 		try {
 			const { createBroadcastTransport } = await import('./bc-transport.js')
-			this.#port = createBroadcastTransport({ endpoint })
+			this.#port = createBroadcastTransport({ endpoint, authToken: this.#authToken })
 			this.#port.start()
 
 			this.#setupPortMonitoring()
