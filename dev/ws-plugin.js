@@ -10,6 +10,7 @@ import { WebSocketServer } from 'ws'
  *   → { type: "unsubscribe", topic: "announcements" }
  *   → { type: "publish",     topic: "announcements", payload: { … } }
  *
+	 *   ← { type: "subscribed",  topic: "announcements" }
  *   ← { type: "message",     topic: "announcements", payload: { … } }
  *
  * A publish is delivered to all subscribers of that topic *except* the sender.
@@ -89,6 +90,7 @@ export function wsPlugin() {
 					switch (type) {
 						case 'subscribe':
 							subscribeTo(topic, ws)
+							ws.send(JSON.stringify({ type: 'subscribed', topic }))
 							break
 
 						case 'unsubscribe':

@@ -5,6 +5,19 @@ const topicPorts = new Map()
 /** topic → latest resume cursor known to the worker */
 const topicResume = new Map()
 
+const WORKER_UPGRADE_PREPARE = 'lit-channel:prepare-worker-upgrade'
+const WORKER_UPGRADE_STATE = 'lit-channel:worker-upgrade-state'
+const WORKER_UPGRADE_READY = 'lit-channel:worker-ready'
+const WORKER_UPGRADE_COMPLETE = 'lit-channel:complete-worker-upgrade'
+const WORKER_VERSION = (() => {
+	try {
+		const url = new URL(self.location.href)
+		return url.searchParams.get('v') || url.searchParams.get('version') || url.toString()
+	} catch (_) {
+		return String(self.location?.href || 'unknown')
+	}
+})()
+
 let ws
 let reconnectTimer
 let heartbeatInterval
@@ -21,6 +34,12 @@ const HEARTBEAT_MS = 30000
 const WS_PING_INTERVAL_MS = 30000
 const WS_PONG_TIMEOUT_MS = 10000
 const WS_HEALTH_CHECK_MAX_MISSES = 3
+const TOPIC_CONTROL_TYPES = new Set([
+	'subscribed',
+	'replay-gap',
+	'replay-complete',
+	'error',
+])
 
 function normalizeStreamSeq(value) {
 	const streamSeq = typeof value === 'number'
@@ -59,6 +78,66 @@ function buildSubscribeFrame(topic) {
 		frame.resume = { ...resume }
 	}
 	return frame
+}
+
+function isTopicFrameForTabs(msg) {
+	return msg && typeof msg === 'object'
+		&& typeof msg.topic === 'string'
+		&& (msg.type === 'message' || TOPIC_CONTROL_TYPES.has(msg.type))
+}
+
+function isGlobalControlFrameForTabs(msg) {
+	return msg && typeof msg === 'object'
+		&& msg.type === 'error'
+		&& typeof msg.topic !== 'string'
+}
+
+function postToTopicPorts(msg) {
+	const subs = topicPorts.get(msg.topic)
+	console.log('[shared-worker] delivering topic=%s to %d ports', msg.topic, subs?.size ?? 0)
+	if (!subs) return
+	for (const port of subs) port.postMessage(msg)
+}
+
+function postToAllPorts(msg) {
+	for (const port of ports.keys()) port.postMessage(msg)
+}
+
+function getPortTopics(port) {
+	const topics = []
+	for (const [topic, subs] of topicPorts) {
+		if (subs.has(port)) {
+			const resume = topicResume.get(topic)
+			topics.push(resume ? { topic, resume: { ...resume } } : { topic })
+		}
+	}
+	return topics
+}
+
+function applyUpgradeState(port, upgrade = {}) {
+	const topics = Array.isArray(upgrade.topics) ? upgrade.topics : []
+	for (const entry of topics) {
+		const topic = typeof entry === 'string' ? entry : entry?.topic
+		if (!topic) continue
+
+		const didAdvance = updateTopicResume(topic, entry?.resume)
+		const shouldSubscribe = !topicPorts.has(topic)
+		if (!topicPorts.has(topic)) {
+			topicPorts.set(topic, new Set())
+		}
+		topicPorts.get(topic).add(port)
+
+		if (shouldSubscribe || didAdvance) {
+			send(buildSubscribeFrame(topic))
+		}
+	}
+
+	const pending = Array.isArray(upgrade.pending) ? upgrade.pending : []
+	for (const frame of pending) {
+		if (frame && typeof frame === 'object') {
+			send(frame)
+		}
+	}
 }
 
 // ---------- WebSocket ----------
@@ -151,12 +230,12 @@ function connectWebSocket() {
 			wsHealthCheckMissCount = 0
 			return
 		}
-		if (msg.type === 'message' && msg.topic) {
-			const subs = topicPorts.get(msg.topic)
-			console.log('[shared-worker] delivering topic=%s to %d ports', msg.topic, subs?.size ?? 0)
-			if (subs) {
-				for (const port of subs) port.postMessage(msg)
-			}
+		if (isTopicFrameForTabs(msg)) {
+			postToTopicPorts(msg)
+			return
+		}
+		if (isGlobalControlFrameForTabs(msg)) {
+			postToAllPorts(msg)
 		}
 	})
 
@@ -205,6 +284,23 @@ function handlePortMessage(port, msg) {
 	const { type, topic, endpoint: nextEndpoint } = msg
 
 	switch (type) {
+		case WORKER_UPGRADE_PREPARE: {
+			port.postMessage({
+				type: WORKER_UPGRADE_STATE,
+				upgradeId: msg.upgradeId,
+				workerVersion: WORKER_VERSION,
+				topics: getPortTopics(port),
+				pending: [],
+			})
+			break
+		}
+		case WORKER_UPGRADE_COMPLETE: {
+			removePort(port, { suppressUnsubscribe: true })
+			try {
+				port.close()
+			} catch (_) {}
+			break
+		}
 		case 'config': {
 			const hasAuthToken = Object.prototype.hasOwnProperty.call(msg, 'authToken')
 			const nextAuthToken = hasAuthToken && typeof msg.authToken === 'string'
@@ -213,21 +309,28 @@ function handlePortMessage(port, msg) {
 			const hasEndpointChange = Boolean(nextEndpoint && nextEndpoint !== endpoint)
 			const hasAuthTokenChange = hasAuthToken && nextAuthToken !== authToken
 
-			if (!hasEndpointChange && !hasAuthTokenChange) {
-				break
+			if (hasEndpointChange || hasAuthTokenChange) {
+				if (hasEndpointChange) {
+					endpoint = nextEndpoint
+				}
+				if (hasAuthTokenChange) {
+					authToken = nextAuthToken
+				}
+				clearTimeout(reconnectTimer)
+				if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
+					ws.close()
+				} else {
+					connectWebSocket()
+				}
 			}
 
-			if (hasEndpointChange) {
-				endpoint = nextEndpoint
-			}
-			if (hasAuthTokenChange) {
-				authToken = nextAuthToken
-			}
-			clearTimeout(reconnectTimer)
-			if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {
-				ws.close()
-			} else {
-				connectWebSocket()
+			if (msg.upgrade) {
+				applyUpgradeState(port, msg.upgrade)
+				port.postMessage({
+					type: WORKER_UPGRADE_READY,
+					upgradeId: msg.upgrade.upgradeId,
+					workerVersion: WORKER_VERSION,
+				})
 			}
 			break
 		}
@@ -273,15 +376,18 @@ function handlePortMessage(port, msg) {
 	}
 }
 
-function removePort(port) {
+function removePort(port, options = {}) {
+	const suppressUnsubscribe = options.suppressUnsubscribe === true
 	console.log('[shared-worker] removing port (%d before)', ports.size)
 	ports.delete(port)
 	for (const [topic, subs] of topicPorts) {
 		subs.delete(port)
 		if (subs.size === 0) {
 			topicPorts.delete(topic)
-			topicResume.delete(topic)
-			send({ type: 'unsubscribe', topic })
+			if (!suppressUnsubscribe) {
+				topicResume.delete(topic)
+				send({ type: 'unsubscribe', topic })
+			}
 		}
 	}
 	if (ports.size === 0) {

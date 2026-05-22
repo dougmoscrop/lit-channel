@@ -20,7 +20,7 @@ let connectionPromise = null
 /** @type {LitChannelConfig} */
 let litChannelConfig = {}
 
-export { SharedSocket } from './SharedSocket.js'
+export { SharedSocket, reloadSharedWorkers } from './SharedSocket.js'
 export { PubSubBridge } from './PubSubBridge.js'
 
 /**
@@ -79,6 +79,9 @@ export class LitChannel extends LitElement {
 
 	_unsubscribe = null
 	_bridge = null
+	_subscriptionAbortController = null
+	_controlHandlers = []
+	_lastSubscribedAck = null
 
 	constructor() {
 		super()
@@ -89,7 +92,10 @@ export class LitChannel extends LitElement {
 	connectedCallback() {
 		super.connectedCallback()
 		getConnection().then((bridge) => {
+			if (!this.isConnected) return
+
 			this._bridge = bridge
+			this._lastSubscribedAck = null
 			this._unsubscribe = bridge.subscribe(this.name, (payload, topic) => {
 				this.dispatchEvent(new CustomEvent('lit-channel-message', {
 					detail: { topic, payload },
@@ -97,13 +103,109 @@ export class LitChannel extends LitElement {
 					composed: true,
 				}))
 			})
+
+			this._subscriptionAbortController = new AbortController()
+			this._attachControlListeners(bridge)
+			bridge.waitForSubscribed?.(this.name, { signal: this._subscriptionAbortController.signal })
+				.then((ack) => this._dispatchSubscribed(ack))
+				.catch((error) => {
+					if (this._subscriptionAbortController?.signal.aborted) return
+					if (error?.frame) return
+					this._dispatchError(error?.frame || { type: 'error', topic: this.name, error })
+				})
 		})
 	}
 
 	disconnectedCallback() {
 		super.disconnectedCallback()
+		this._subscriptionAbortController?.abort()
+		this._subscriptionAbortController = null
+		this._detachControlListeners()
 		this._unsubscribe?.()
 		this._unsubscribe = null
+		this._lastSubscribedAck = null
+	}
+
+	_attachControlListeners(bridge) {
+		this._detachControlListeners()
+
+		for (const type of ['subscribed', 'error', 'replay-gap', 'replay-complete', 'control']) {
+			const listener = (event) => this._handleBridgeControl(type, event.detail)
+			bridge.addEventListener(type, listener)
+			this._controlHandlers.push({ type, listener })
+		}
+	}
+
+	_detachControlListeners() {
+		if (!this._bridge) {
+			this._controlHandlers = []
+			return
+		}
+
+		for (const { type, listener } of this._controlHandlers) {
+			this._bridge.removeEventListener(type, listener)
+		}
+		this._controlHandlers = []
+	}
+
+	_handleBridgeControl(type, detail) {
+		if (!detail) return
+		if (detail.topic && detail.topic !== this.name) return
+
+		if (type === 'control') {
+			this._dispatchControl(detail)
+			return
+		}
+
+		if (type === 'subscribed') {
+			this._dispatchSubscribed(detail)
+			return
+		}
+
+		if (type === 'error') {
+			this._dispatchError(detail)
+			return
+		}
+
+		this._dispatchTypedControl(type, detail)
+	}
+
+	_dispatchSubscribed(ack) {
+		if (!this.isConnected || !ack || ack.topic !== this.name) return
+		if (ack === this._lastSubscribedAck) return
+		this._lastSubscribedAck = ack
+		this.dispatchEvent(new CustomEvent('lit-channel-subscribed', {
+			detail: { topic: ack.topic, resume: ack.resume },
+			bubbles: true,
+			composed: true,
+		}))
+	}
+
+	_dispatchError(frame) {
+		if (!this.isConnected) return
+		this.dispatchEvent(new CustomEvent('lit-channel-error', {
+			detail: { frame },
+			bubbles: true,
+			composed: true,
+		}))
+	}
+
+	_dispatchControl(frame) {
+		if (!this.isConnected) return
+		this.dispatchEvent(new CustomEvent('lit-channel-control', {
+			detail: { frame },
+			bubbles: true,
+			composed: true,
+		}))
+	}
+
+	_dispatchTypedControl(type, frame) {
+		if (!this.isConnected) return
+		this.dispatchEvent(new CustomEvent(`lit-channel-${type}`, {
+			detail: { frame },
+			bubbles: true,
+			composed: true,
+		}))
 	}
 
 	/**

@@ -15,6 +15,13 @@
 
 export const DEFAULT_EVENT_ID_DEDUPE_LIMIT = 1024
 
+const CONTROL_FRAME_TYPES = new Set([
+	'subscribed',
+	'replay-gap',
+	'replay-complete',
+	'error',
+])
+
 function createSessionId() {
 	if (globalThis.crypto?.randomUUID) {
 		return globalThis.crypto.randomUUID()
@@ -49,6 +56,34 @@ function normalizeDedupeLimit(value) {
 	const limit = Number(value)
 	if (!Number.isFinite(limit) || limit < 0) return DEFAULT_EVENT_ID_DEDUPE_LIMIT
 	return Math.floor(limit)
+}
+
+function normalizeTimeout(value) {
+	if (value === undefined) return undefined
+	const timeout = Number(value)
+	if (!Number.isFinite(timeout) || timeout < 0) {
+		throw new Error('timeout must be a non-negative number')
+	}
+	return Math.floor(timeout)
+}
+
+function createAbortError(signal) {
+	if (signal?.reason !== undefined) return signal.reason
+	if (typeof DOMException === 'function') {
+		return new DOMException('The operation was aborted.', 'AbortError')
+	}
+	const error = new Error('The operation was aborted.')
+	error.name = 'AbortError'
+	return error
+}
+
+function createSubscriptionError(frame) {
+	const topicSuffix = typeof frame.topic === 'string' ? ` for topic ${frame.topic}` : ''
+	const reason = frame.reason || frame.error || 'subscription error'
+	/** @type {Error & { frame?: any }} */
+	const error = new Error(`Subscription failed${topicSuffix}: ${reason}`)
+	error.frame = frame
+	return error
 }
 
 export class PubSubBridge {
@@ -95,6 +130,15 @@ export class PubSubBridge {
 	/** @type {Map<string, { ids: Set<string>, order: string[] }>} */
 	#seenEventIds = new Map()
 
+	/** @type {EventTarget} */
+	#eventTarget = new EventTarget()
+
+	/** @type {Map<string, any>} */
+	#subscriptionAcks = new Map()
+
+	/** @type {Map<string, Set<any>>} */
+	#subscriptionWaiters = new Map()
+
 	/**
 	 * Create a new PubSubBridge.
 	 * @param {Object} connection - WebSocket-like object with postMessage and onmessage support
@@ -125,6 +169,81 @@ export class PubSubBridge {
 		return this.#sessionId
 	}
 
+	addEventListener(type, listener, options) {
+		this.#eventTarget.addEventListener(type, listener, options)
+	}
+
+	removeEventListener(type, listener, options) {
+		this.#eventTarget.removeEventListener(type, listener, options)
+	}
+
+	waitForSubscribed(topic, options = {}) {
+		const existing = this.#subscriptionAcks.get(topic)
+		if (existing) return Promise.resolve(existing)
+
+		let timeoutMs
+		try {
+			timeoutMs = normalizeTimeout(options.timeout)
+		} catch (error) {
+			return Promise.reject(error)
+		}
+
+		const signal = options.signal
+		if (signal?.aborted) {
+			return Promise.reject(createAbortError(signal))
+		}
+
+		return new Promise((resolve, reject) => {
+			if (!this.#subscriptionWaiters.has(topic)) {
+				this.#subscriptionWaiters.set(topic, new Set())
+			}
+
+			const waiters = this.#subscriptionWaiters.get(topic)
+			let waiter
+
+			const cleanup = () => {
+				waiters.delete(waiter)
+				if (waiters.size === 0) {
+					this.#subscriptionWaiters.delete(topic)
+				}
+				if (waiter.timeoutId !== null) {
+					clearTimeout(waiter.timeoutId)
+					waiter.timeoutId = null
+				}
+				if (signal && waiter.abortHandler) {
+					signal.removeEventListener('abort', waiter.abortHandler)
+					waiter.abortHandler = null
+				}
+			}
+
+			waiter = {
+				timeoutId: null,
+				abortHandler: null,
+				resolve(value) {
+					cleanup()
+					resolve(value)
+				},
+				reject(error) {
+					cleanup()
+					reject(error)
+				},
+			}
+
+			if (signal) {
+				waiter.abortHandler = () => waiter.reject(createAbortError(signal))
+				signal.addEventListener('abort', waiter.abortHandler, { once: true })
+			}
+
+			if (timeoutMs !== undefined) {
+				waiter.timeoutId = setTimeout(() => {
+					waiter.reject(new Error(`Timed out waiting for subscribed ACK for topic ${topic}`))
+				}, timeoutMs)
+			}
+
+			waiters.add(waiter)
+		})
+	}
+
 	/**
 	 * Wire up the onmessage handler on the connection.
 	 */
@@ -136,8 +255,11 @@ export class PubSubBridge {
 			// Call original handler if it exists
 			originalHandler?.call(this.#connection, e)
 
+			const frame = e.data
+			if (!frame || typeof frame !== 'object') return
+
 			// Route messages by topic to subscribers
-			const { type, topic, payload } = e.data
+			const { type, topic, payload } = frame
 
 			if (type === 'ping') {
 				console.debug('[PubSubBridge] received ping, sending pong')
@@ -149,6 +271,8 @@ export class PubSubBridge {
 				console.debug('[PubSubBridge] received pong')
 				return
 			}
+
+			if (this.#handleControlFrame(frame)) return
 
 			if (type === 'message' && topic) {
 				if (!this.#processResumeEnvelope(topic, payload)) return
@@ -167,6 +291,66 @@ export class PubSubBridge {
 		}
 
 		this.#handlerAttached = true
+	}
+
+	#emit(type, detail) {
+		this.#eventTarget.dispatchEvent(new CustomEvent(type, { detail }))
+	}
+
+	#emitControlFrame(frame) {
+		const detail = { ...frame }
+		this.#emit('control', detail)
+		this.#emit(frame.type, detail)
+		return detail
+	}
+
+	#handleControlFrame(frame) {
+		if (!CONTROL_FRAME_TYPES.has(frame.type)) return false
+
+		const hasTopic = typeof frame.topic === 'string'
+		if (hasTopic && !this.#activeSubscriptions.has(frame.topic)) return true
+
+		if (!hasTopic && frame.type !== 'error') return true
+
+		if (frame.type === 'subscribed') {
+			const detail = this.#emitControlFrame(frame)
+			this.#subscriptionAcks.set(frame.topic, detail)
+			this.#resolveSubscribedWaiters(frame.topic, detail)
+			return true
+		}
+
+		if (frame.type === 'error') {
+			const detail = this.#emitControlFrame(frame)
+			if (hasTopic) {
+				this.#rejectSubscribedWaiters(frame.topic, createSubscriptionError(detail))
+			}
+			return true
+		}
+
+		this.#emitControlFrame(frame)
+		return true
+	}
+
+	#resolveSubscribedWaiters(topic, ack) {
+		const waiters = this.#subscriptionWaiters.get(topic)
+		if (!waiters) return
+		for (const waiter of Array.from(waiters)) {
+			waiter.resolve(ack)
+		}
+	}
+
+	#rejectSubscribedWaiters(topic, error) {
+		const waiters = this.#subscriptionWaiters.get(topic)
+		if (!waiters) return
+		for (const waiter of Array.from(waiters)) {
+			waiter.reject(error)
+		}
+	}
+
+	#clearActiveSubscriptionAcks() {
+		for (const topic of this.#activeSubscriptions) {
+			this.#subscriptionAcks.delete(topic)
+		}
 	}
 
 	#processResumeEnvelope(topic, payload) {
@@ -300,6 +484,7 @@ export class PubSubBridge {
 
 			this.#connection.addEventListener('reconnected', () => {
 				console.log('[PubSubBridge] Connection restored, resubscribing to %d topics', this.#activeSubscriptions.size)
+				this.#clearActiveSubscriptionAcks()
 				this.#scheduleResubscribe()
 			})
 
@@ -387,6 +572,8 @@ export class PubSubBridge {
 		if (cbs.size === 0) {
 			this.#listeners.delete(topic)
 			this.#activeSubscriptions.delete(topic)
+			this.#subscriptionAcks.delete(topic)
+			this.#rejectSubscribedWaiters(topic, new Error(`Subscription ended before subscribed ACK for topic ${topic}`))
 			try {
 				this.#connection.postMessage({ type: 'unsubscribe', topic })
 				console.debug('[PubSubBridge] Unsubscribed from', topic)

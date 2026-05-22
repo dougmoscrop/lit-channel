@@ -20,6 +20,24 @@ const BC_NAME = 'lit-channel-transport'
 const LEADER_PING_INTERVAL = 30000  // Send pings every 30 seconds
 const LEADER_PING_TIMEOUT = 10000   // Expect pong within 10 seconds
 const LEADER_PING_MAX_MISSES = 3    // Close after 3 consecutive missed pongs
+const TOPIC_CONTROL_TYPES = new Set([
+	'subscribed',
+	'replay-gap',
+	'replay-complete',
+	'error',
+])
+
+function isTopicFrameForTabs(msg) {
+	return msg && typeof msg === 'object'
+		&& typeof msg.topic === 'string'
+		&& (msg.type === 'message' || TOPIC_CONTROL_TYPES.has(msg.type))
+}
+
+function isGlobalControlFrameForTabs(msg) {
+	return msg && typeof msg === 'object'
+		&& msg.type === 'error'
+		&& typeof msg.topic !== 'string'
+}
 
 export function createBroadcastTransport(options = {}) {
 	const websocketUrl = options.endpoint ?? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/ws`
@@ -182,10 +200,11 @@ export function createBroadcastTransport(options = {}) {
 					return
 				}
 
-				if (msg.type === 'message' && msg.topic) {
+				if (isTopicFrameForTabs(msg) || isGlobalControlFrameForTabs(msg)) {
 					// Relay server messages to all tabs (including ourselves)
 					_onmessage?.({ data: msg })
 					bc.postMessage(msg)
+					return
 				}
 			} catch (err) {
 				console.error('[bc-transport] error parsing message:', err)
@@ -259,6 +278,13 @@ export function createBroadcastTransport(options = {}) {
 
 			case 'message':
 				// Server-originated message relayed by the leader
+				_onmessage?.({ data: msg })
+				break
+
+			case 'subscribed':
+			case 'replay-gap':
+			case 'replay-complete':
+			case 'error':
 				_onmessage?.({ data: msg })
 				break
 

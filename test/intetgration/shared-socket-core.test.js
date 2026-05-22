@@ -348,6 +348,121 @@ describe('SharedSocket core behavior', () => {
 		}
 	})
 
+	it('should upgrade a SharedWorker URL and flush messages queued during the swap', async () => {
+		const postedByInstance = []
+		const closedPorts = []
+
+		function createPort(instanceIndex) {
+			const listeners = new Map()
+			const posted = []
+			postedByInstance.push(posted)
+
+			const emit = (message) => {
+				const event = { data: message }
+				for (const listener of listeners.get('message') || []) {
+					listener(event)
+				}
+				port.onmessage?.(event)
+			}
+
+			const port = {
+				onmessage: null,
+				start() {},
+				postMessage(message) {
+					posted.push(message)
+					if (message.type === 'lit-channel:prepare-worker-upgrade') {
+						queueMicrotask(() => emit({
+							type: 'lit-channel:worker-upgrade-state',
+							upgradeId: message.upgradeId,
+							workerVersion: 'v1',
+							topics: [
+								{ topic: 'upgrade-topic', resume: { streamSeq: 4, cursor: '4', sessionId: 'test-session' } },
+							],
+							pending: [],
+						}))
+					}
+					if (instanceIndex === 1 && message.type === 'config' && message.upgrade) {
+						queueMicrotask(() => emit({
+							type: 'lit-channel:worker-ready',
+							upgradeId: message.upgrade.upgradeId,
+							workerVersion: 'v2',
+						}))
+					}
+				},
+				addEventListener(type, listener) {
+					if (!listeners.has(type)) listeners.set(type, [])
+					listeners.get(type).push(listener)
+				},
+				removeEventListener(type, listener) {
+					const current = listeners.get(type) || []
+					listeners.set(type, current.filter(candidate => candidate !== listener))
+				},
+				close() {
+					closedPorts.push(instanceIndex)
+				},
+			}
+
+			return port
+		}
+
+		let workerIndex = 0
+		const constructedUrls = []
+		window.SharedWorker = /** @type {any} */ (class {
+			constructor(url) {
+				constructedUrls.push(url)
+				this.port = createPort(workerIndex++)
+			}
+		})
+
+		const socket = new SharedSocket({ endpoint: '/upgrade/ws', workerUrl: '/worker/v1.js?v=1' })
+		const reconnectedEvents = []
+		socket.addEventListener('reconnected', (event) => reconnectedEvents.push(event.detail))
+
+		try {
+			await socket.connect()
+			const upgradePromise = socket.upgradeWorker('/worker/v2.js?v=2', {
+				workerVersion: 'v2',
+				deadlineMs: 100,
+			})
+			socket.postMessage({ type: 'publish', topic: 'upgrade-topic', payload: { during: true } })
+			const upgraded = await upgradePromise
+			await new Promise(resolve => setTimeout(resolve, 0))
+
+			expect(upgraded).to.equal(true)
+			expect(constructedUrls).to.deep.equal([
+				`${window.location.protocol}//${window.location.host}/worker/v1.js?v=1`,
+				`${window.location.protocol}//${window.location.host}/worker/v2.js?v=2`,
+			])
+			expect(postedByInstance[0]).to.deep.include({
+				type: 'config',
+				endpoint: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/upgrade/ws`,
+			})
+			expect(postedByInstance[0].some(message => message.type === 'lit-channel:prepare-worker-upgrade')).to.equal(true)
+			expect(postedByInstance[0].some(message => message.type === 'lit-channel:complete-worker-upgrade')).to.equal(true)
+			expect(postedByInstance[1][0]).to.deep.include({
+				type: 'config',
+				endpoint: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/upgrade/ws`,
+			})
+			expect(postedByInstance[1][0].upgrade).to.deep.include({
+				previousWorkerVersion: '1',
+				nextWorkerVersion: 'v2',
+			})
+			expect(postedByInstance[1][0].upgrade.topics).to.deep.equal([
+				{ topic: 'upgrade-topic', resume: { streamSeq: 4, cursor: '4', sessionId: 'test-session' } },
+			])
+			expect(postedByInstance[1][1]).to.deep.equal({
+				type: 'publish',
+				topic: 'upgrade-topic',
+				payload: { during: true },
+			})
+			expect(reconnectedEvents).to.have.lengthOf(1)
+			expect(reconnectedEvents[0].workerVersion).to.equal('v2')
+			expect(closedPorts).to.include(0)
+		} finally {
+			await socket.close()
+		}
+	})
+
 	it('should forward resume subscribe and ack frames through SharedWorker port', async () => {
 		const postedMessages = []
 		let capturedPort = null

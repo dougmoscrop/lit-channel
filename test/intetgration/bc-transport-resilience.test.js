@@ -218,6 +218,84 @@ describe('BroadcastChannel transport resilience', () => {
 		}
 	})
 
+	it('should relay subscribed ACKs to leader and follower bridges in BroadcastChannel fallback', async () => {
+		const FakeWebSocket = createFakeWebSocketClass()
+
+		window.SharedWorker = undefined
+		window.WebSocket = /** @type {any} */ (FakeWebSocket)
+
+		const socketA = new SharedSocket()
+		const socketB = new SharedSocket()
+		try {
+			await socketA.connect()
+			await socketB.connect()
+			await waitFor(() => FakeWebSocket.instances.length >= 1)
+
+			const topic = `bc-subscribed-${Date.now()}`
+			const bridgeA = new PubSubBridge(socketA)
+			const bridgeB = new PubSubBridge(socketB)
+			const unsubscribeA = bridgeA.subscribe(topic, () => {})
+			const unsubscribeB = bridgeB.subscribe(topic, () => {})
+
+			const ackA = bridgeA.waitForSubscribed(topic, { timeout: 1000 })
+			const ackB = bridgeB.waitForSubscribed(topic, { timeout: 1000 })
+			FakeWebSocket.instances[0].emitOpen()
+			FakeWebSocket.instances[0].emit('message', {
+				data: JSON.stringify({ type: 'subscribed', topic, resume: { accepted: true } }),
+			})
+
+			expect(await ackA).to.deep.equal({ type: 'subscribed', topic, resume: { accepted: true } })
+			expect(await ackB).to.deep.equal({ type: 'subscribed', topic, resume: { accepted: true } })
+
+			unsubscribeA()
+			unsubscribeB()
+		} finally {
+			await socketA.close()
+			await socketB.close()
+		}
+	})
+
+	it('should relay replay and error control frames in BroadcastChannel fallback', async () => {
+		const FakeWebSocket = createFakeWebSocketClass()
+
+		window.SharedWorker = undefined
+		window.WebSocket = /** @type {any} */ (FakeWebSocket)
+
+		const socket = new SharedSocket()
+		try {
+			await socket.connect()
+			await waitFor(() => FakeWebSocket.instances.length >= 1)
+
+			const bridge = new PubSubBridge(socket)
+			const replayEvents = []
+			const errorEvents = []
+			bridge.addEventListener('replay-complete', (event) => replayEvents.push(event.detail))
+			bridge.addEventListener('error', (event) => errorEvents.push(event.detail))
+			bridge.subscribe('bc-control-topic', () => {})
+			FakeWebSocket.instances[0].emitOpen()
+
+			FakeWebSocket.instances[0].emit('message', {
+				data: JSON.stringify({ type: 'replay-complete', topic: 'bc-control-topic', fromSeq: 3, toSeq: 5 }),
+			})
+			FakeWebSocket.instances[0].emit('message', {
+				data: JSON.stringify({ type: 'error', topic: 'bc-control-topic', error: 'forbidden' }),
+			})
+			FakeWebSocket.instances[0].emit('message', {
+				data: JSON.stringify({ type: 'error', error: 'global' }),
+			})
+
+			expect(replayEvents).to.deep.equal([
+				{ type: 'replay-complete', topic: 'bc-control-topic', fromSeq: 3, toSeq: 5 },
+			])
+			expect(errorEvents).to.deep.equal([
+				{ type: 'error', topic: 'bc-control-topic', error: 'forbidden' },
+				{ type: 'error', error: 'global' },
+			])
+		} finally {
+			await socket.close()
+		}
+	})
+
 	it('should replay resume cursor when BroadcastChannel websocket reconnects', async () => {
 		const FakeWebSocket = createFakeWebSocketClass()
 

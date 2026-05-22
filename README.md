@@ -123,7 +123,107 @@ Both transports support the same resume and ack frames:
 
 Consumers currently patching `node_modules/lit-channel` can remove those overrides and configure first-class resume support through `configureLitChannel` or `new PubSubBridge(socket, options)`. If you persisted cursors in the prototype, return them from `getResumeCursor(topic)` using `{ streamSeq, cursor }`.
 
+## Subscription Readiness and Control Frames
+
+Servers can confirm that a subscription is established by sending a topic-scoped `subscribed` frame after accepting the client subscribe request:
+
+```json
+{ "type": "subscribed", "topic": "orders" }
+```
+
+Resume-aware servers can include ACK metadata, which lit-channel preserves on bridge and element events:
+
+```json
+{
+  "type": "subscribed",
+  "topic": "orders",
+  "resume": {
+    "accepted": true,
+    "startSeq": 43,
+    "serverCursor": "42",
+    "replayEligible": true
+  }
+}
+```
+
+`PubSubBridge` exposes control frames separately from data callbacks. `subscribe(topic, callback)` still delivers only `type: "message"` payloads.
+
+```js
+const unsubscribe = bridge.subscribe('orders', (payload, topic) => {
+  console.log('message', topic, payload)
+})
+
+bridge.addEventListener('subscribed', (event) => {
+  console.log('ready', event.detail.topic, event.detail.resume)
+})
+
+await bridge.waitForSubscribed('orders', { timeout: 5000 })
+```
+
+`waitForSubscribed(topic, options)` resolves immediately when the latest ACK for that active topic is already known, or waits for the next matching `subscribed` frame. Pass `options.signal` to cancel or `options.timeout` to reject after a caller-defined deadline. A matching topic-scoped `error` frame rejects pending waiters. Topicless `error` frames are emitted as global bridge `error` and `control` events, but do not reject every subscription waiter.
+
+The bridge emits these events with the original frame fields in `event.detail`:
+
+- `control`
+- `subscribed`
+- `error`
+- `replay-gap`
+- `replay-complete`
+
+Known subscribed ACK state is cleared when the last local listener for a topic unsubscribes. Active topic ACK state is also invalidated after a reconnect, then a fresh `subscribed` event is emitted when the server ACKs the resubscription.
+
+`<lit-channel>` dispatches DOM events for the same control surface:
+
+- `lit-channel-subscribed` with `detail: { topic, resume }`
+- `lit-channel-error` with `detail: { frame }`
+- `lit-channel-replay-gap` with `detail: { frame }`
+- `lit-channel-replay-complete` with `detail: { frame }`
+- `lit-channel-control` with `detail: { frame }`
+
+All element events bubble and are composed. `lit-channel-message` remains data-only and is not fired for `subscribed`, `error`, `replay-gap`, or `replay-complete` frames.
+
+## SharedWorker Upgrades
+
+When the SharedWorker script URL changes, call `upgradeWorker()` with the new fingerprinted URL instead of reloading the page:
+
+```js
+import { SharedSocket } from 'lit-channel'
+
+const socket = new SharedSocket({ workerUrl: '/assets/lit-channel/shared-worker-a1b2c3.js' })
+await socket.connect()
+
+await socket.upgradeWorker('/assets/lit-channel/shared-worker-d4e5f6.js')
+```
+
+For singleton `<lit-channel>` usage, `reloadSharedWorkers(workerUrl)` upgrades every active `SharedSocket` instance in the current page:
+
+```js
+import { reloadSharedWorkers } from 'lit-channel'
+
+await reloadSharedWorkers('/assets/lit-channel/shared-worker-d4e5f6.js')
+```
+
+During an upgrade, `SharedSocket` asks the old worker for its active topics and resume cursors, starts a new worker from the next URL, sends the snapshot in the new worker config, queues page-originated messages while the swap is in progress, then emits the normal `reconnected` event so `PubSubBridge` can resubscribe with its latest cursors. The old worker keeps already accepted work alive until the handoff completes.
+
+Lossless inbound upgrades require the resume/replay protocol above and a server that honors resume cursors. Without server replay, lit-channel preserves client-side queued messages during the swap, but a server message sent between two WebSocket subscriptions cannot be reconstructed by the browser alone.
+
 Using this element requires the `@web/rollup-plugin-import-meta-assets` in your build
+
+## Backlog
+
+### Split the package into lit-channel, shared-socket, and shared-worker-service
+
+Split the current package into three libraries so `<lit-channel>` becomes a thin LitElement integration over reusable shared-worker and socket infrastructure.
+
+- `lit-channel`: keep the public web component, singleton configuration, and browser-facing events. It should consume `shared-socket` instead of owning worker and socket lifecycle code.
+- `shared-socket`: move the shared WebSocket client, pub/sub bridge, resume/replay support, BroadcastChannel fallback, worker upgrade/reconnect behavior, and related tests here.
+- `shared-worker-service`: introduce a SharedWorker host wrapper with lifecycle hooks for registering services to run inside a SharedWorker. `shared-socket` should be hosted inside this platform as the first service.
+
+Acceptance notes:
+
+- Preserve current `lit-channel` imports or provide a migration path for `SharedSocket`, `PubSubBridge`, and `reloadSharedWorkers`.
+- Define package boundaries, build outputs, and test ownership before moving code.
+- Keep SharedWorker upgrade and resume behavior covered across package boundaries.
 
 ## Development
 

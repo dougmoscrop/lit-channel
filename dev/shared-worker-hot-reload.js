@@ -4,9 +4,12 @@
 //   sharedWorkerUrl
 export function _hotReloadWorker(newHash) {
 	if (!('SharedWorker' in window)) return
-	console.debug('[SharedSocket] hot-reloading shared worker, hash:', newHash)
+	const nextWorkerUrl = new URL(sharedWorkerUrl.toString(), window.location.href)
+	nextWorkerUrl.searchParams.set('v', newHash)
 
-	// Trigger full page reload for simplicity - SharedWorker is shared across tabs
-	// and we need to ensure all tabs get the new worker
-	window.location.reload()
+	console.debug('[SharedSocket] hot-reloading shared worker, hash:', newHash)
+	return reloadSharedWorkers(nextWorkerUrl.toString(), {
+		workerVersion: newHash,
+		deadlineMs: 2000,
+	})
 }

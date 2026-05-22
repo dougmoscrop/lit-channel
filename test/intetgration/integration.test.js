@@ -11,6 +11,27 @@ describe('Transport Integration', () => {
 	let socket = null
 	let bridge = null
 
+	function wsUrl() {
+		return `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws`
+	}
+
+	function openRawWebSocket() {
+		return new Promise((resolve, reject) => {
+			const ws = new WebSocket(wsUrl())
+			ws.addEventListener('open', () => resolve(ws), { once: true })
+			ws.addEventListener('error', () => reject(new Error('raw websocket failed to open')), { once: true })
+		})
+	}
+
+	async function publishRaw(topic, payload) {
+		const ws = await openRawWebSocket()
+		try {
+			ws.send(JSON.stringify({ type: 'publish', topic, payload }))
+		} finally {
+			setTimeout(() => ws.close(), 0)
+		}
+	}
+
 	afterEach(() => {
 		subscriptions.forEach(unsub => unsub?.())
 		subscriptions.length = 0
@@ -388,6 +409,53 @@ describe('Transport Integration', () => {
 			expect(sharedWorkerResult.eventsB).to.deep.equal([
 				{ topic: 'parity-topic', payload: { seq: 1, text: 'first' } },
 			])
+		})
+
+		async function runSubscribedAckScenario(forceFallback) {
+			const originalSharedWorker = window.SharedWorker
+			if (forceFallback) {
+				window.SharedWorker = undefined
+			}
+
+			const localSocket = new SharedSocket()
+			let unsubscribe = null
+			try {
+				await localSocket.connect()
+				const localBridge = new PubSubBridge(localSocket)
+				const topic = `transport-ack-${forceFallback ? 'bc' : 'sw'}-${Date.now()}-${Math.random()}`
+				const order = []
+
+				localBridge.addEventListener('subscribed', (event) => {
+					if (event.detail.topic === topic) order.push('subscribed')
+				})
+
+				const messagePromise = new Promise((resolve) => {
+					unsubscribe = localBridge.subscribe(topic, (payload) => {
+						order.push('message')
+						resolve(payload)
+					})
+				})
+
+				const ack = await localBridge.waitForSubscribed(topic, { timeout: 3000 })
+				expect(ack).to.deep.equal({ type: 'subscribed', topic })
+
+				await publishRaw(topic, { id: 1 })
+				expect(await messagePromise).to.deep.equal({ id: 1 })
+				expect(order).to.deep.equal(['subscribed', 'message'])
+			} finally {
+				unsubscribe?.()
+				await localSocket.close()
+				window.SharedWorker = originalSharedWorker
+			}
+		}
+
+		it('should surface subscribed ACKs before later data messages in both transports', async () => {
+			await runSubscribedAckScenario(true)
+
+			const hasSharedWorker = typeof window.SharedWorker !== 'undefined'
+			if (hasSharedWorker) {
+				await runSubscribedAckScenario(false)
+			}
 		})
 	})
 })

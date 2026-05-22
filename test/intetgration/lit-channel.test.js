@@ -1,6 +1,50 @@
 import { expect } from '@esm-bundle/chai'
 import { html, fixture } from '@open-wc/testing'
-import '../../src/lit-channel.js'
+import { __resetConnectionForTests } from '../../src/lit-channel.js'
+
+function installFakeSharedWorker() {
+	const OriginalSharedWorker = window.SharedWorker
+	const postedMessages = []
+	const ports = []
+
+	window.SharedWorker = /** @type {any} */ (class {
+		constructor() {
+			const listeners = new Map()
+			const port = {
+				onmessage: null,
+				start() {},
+				close() {},
+				postMessage(message) {
+					postedMessages.push(message)
+				},
+				addEventListener(type, listener) {
+					if (!listeners.has(type)) listeners.set(type, new Set())
+					listeners.get(type).add(listener)
+				},
+				removeEventListener(type, listener) {
+					listeners.get(type)?.delete(listener)
+				},
+				emit(message) {
+					const event = { data: message }
+					this.onmessage?.(event)
+					for (const listener of listeners.get('message') || []) {
+						listener(event)
+					}
+				},
+			}
+			ports.push(port)
+			this.port = port
+		}
+	})
+
+	return {
+		postedMessages,
+		ports,
+		restore() {
+			window.SharedWorker = OriginalSharedWorker
+		},
+	}
+}
 
 async function waitForBridge(element, timeoutMs = 2000) {
 	const started = Date.now()
@@ -31,6 +75,7 @@ describe('LitChannel', () => {
 		if (element?.parentElement) {
 			element.parentElement.removeChild(element)
 		}
+		await __resetConnectionForTests()
 	})
 
 	it('should render with default properties', async () => {
@@ -118,6 +163,117 @@ describe('LitChannel', () => {
 
 		expect(eventDetail.topic).to.equal('test')
 		expect(eventDetail.payload).to.deep.equal(payload)
+	})
+
+	it('should dispatch lit-channel-subscribed from a server ACK without dispatching a message', async () => {
+		const fake = installFakeSharedWorker()
+		try {
+			element = await fixture(html`<lit-channel name="orders"></lit-channel>`)
+			await waitForSubscription(element)
+
+			const subscribedEvents = []
+			let messageCount = 0
+			element.addEventListener('lit-channel-subscribed', (event) => subscribedEvents.push(event))
+			element.addEventListener('lit-channel-message', () => {
+				messageCount += 1
+			})
+
+			fake.ports[0].emit({
+				type: 'subscribed',
+				topic: 'orders',
+				resume: { accepted: true, startSeq: 43 },
+			})
+			await Promise.resolve()
+
+			expect(messageCount).to.equal(0)
+			expect(subscribedEvents).to.have.lengthOf(1)
+			expect(subscribedEvents[0].bubbles).to.equal(true)
+			expect(subscribedEvents[0].composed).to.equal(true)
+			expect(subscribedEvents[0].detail).to.deep.equal({
+				topic: 'orders',
+				resume: { accepted: true, startSeq: 43 },
+			})
+		} finally {
+			fake.restore()
+		}
+	})
+
+	it('should not dispatch lit-channel-subscribed for another topic', async () => {
+		const fake = installFakeSharedWorker()
+		try {
+			element = await fixture(html`<lit-channel name="orders"></lit-channel>`)
+			await waitForSubscription(element)
+
+			let subscribedCount = 0
+			element.addEventListener('lit-channel-subscribed', () => {
+				subscribedCount += 1
+			})
+
+			fake.ports[0].emit({ type: 'subscribed', topic: 'invoices' })
+			await Promise.resolve()
+
+			expect(subscribedCount).to.equal(0)
+		} finally {
+			fake.restore()
+		}
+	})
+
+	it('should dispatch replay and error control events from bridge frames', async () => {
+		const fake = installFakeSharedWorker()
+		try {
+			element = await fixture(html`<lit-channel name="orders"></lit-channel>`)
+			await waitForSubscription(element)
+
+			const replayEvents = []
+			const errorEvents = []
+			const controlEvents = []
+			element.addEventListener('lit-channel-replay-gap', (event) => replayEvents.push(event.detail))
+			element.addEventListener('lit-channel-error', (event) => errorEvents.push(event.detail))
+			element.addEventListener('lit-channel-control', (event) => controlEvents.push(event.detail))
+
+			fake.ports[0].emit({
+				type: 'replay-gap',
+				topic: 'orders',
+				reason: 'expired_or_trimmed',
+				refreshHint: 'http',
+			})
+			fake.ports[0].emit({ type: 'error', error: 'global' })
+			await Promise.resolve()
+
+			expect(replayEvents).to.deep.equal([
+				{ frame: { type: 'replay-gap', topic: 'orders', reason: 'expired_or_trimmed', refreshHint: 'http' } },
+			])
+			expect(errorEvents).to.deep.equal([
+				{ frame: { type: 'error', error: 'global' } },
+			])
+			expect(controlEvents).to.deep.equal([
+				{ frame: { type: 'replay-gap', topic: 'orders', reason: 'expired_or_trimmed', refreshHint: 'http' } },
+				{ frame: { type: 'error', error: 'global' } },
+			])
+		} finally {
+			fake.restore()
+		}
+	})
+
+	it('should not dispatch stale subscribed events after disconnect', async () => {
+		const fake = installFakeSharedWorker()
+		try {
+			element = await fixture(html`<lit-channel name="orders"></lit-channel>`)
+			await waitForSubscription(element)
+
+			let subscribedCount = 0
+			element.addEventListener('lit-channel-subscribed', () => {
+				subscribedCount += 1
+			})
+
+			element.remove()
+			fake.ports[0].emit({ type: 'subscribed', topic: 'orders' })
+			await Promise.resolve()
+
+			expect(subscribedCount).to.equal(0)
+		} finally {
+			fake.restore()
+		}
 	})
 
 	it('should emit exactly one lit-channel-send event with exact contract', async () => {

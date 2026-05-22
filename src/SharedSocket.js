@@ -15,6 +15,63 @@
 
 const sharedWorkerUrl = new URL('./shared-worker.js', import.meta.url)
 
+const WORKER_UPGRADE_PREPARE = 'lit-channel:prepare-worker-upgrade'
+const WORKER_UPGRADE_STATE = 'lit-channel:worker-upgrade-state'
+const WORKER_UPGRADE_READY = 'lit-channel:worker-ready'
+const WORKER_UPGRADE_COMPLETE = 'lit-channel:complete-worker-upgrade'
+const DEFAULT_WORKER_UPGRADE_DEADLINE_MS = 5000
+const SOCKET_REGISTRY_KEY = '__litChannelSharedSockets'
+
+/**
+ * @typedef {MessagePort | {
+ * 	postMessage: Function,
+ * 	onmessage: Function | null,
+ * 	start: Function,
+ * 	close?: Function,
+ * 	addEventListener?: Function,
+ * 	removeEventListener?: Function,
+ * }} SharedSocketPort
+ */
+
+function getSocketRegistry() {
+	if (typeof globalThis === 'undefined') return undefined
+	if (!globalThis[SOCKET_REGISTRY_KEY]) {
+		globalThis[SOCKET_REGISTRY_KEY] = new Set()
+	}
+	return globalThis[SOCKET_REGISTRY_KEY]
+}
+
+function createUpgradeId() {
+	if (globalThis.crypto?.randomUUID) {
+		return globalThis.crypto.randomUUID()
+	}
+	return `lit-channel-upgrade-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+function normalizeDeadlineMs(value) {
+	const deadlineMs = Number(value)
+	if (!Number.isFinite(deadlineMs) || deadlineMs < 0) return DEFAULT_WORKER_UPGRADE_DEADLINE_MS
+	return Math.floor(deadlineMs)
+}
+
+function controlMessageKey(type, upgradeId) {
+	return `${type}:${upgradeId || ''}`
+}
+
+export async function reloadSharedWorkers(workerUrl, options = {}) {
+	const registry = getSocketRegistry()
+	if (!registry || registry.size === 0) return []
+
+	const upgrades = []
+	for (const socket of registry) {
+		if (typeof socket?.upgradeWorker === 'function') {
+			upgrades.push(socket.upgradeWorker(workerUrl, options))
+		}
+	}
+
+	return Promise.all(upgrades)
+}
+
 export function getConfiguredEndpoint(doc = document) {
 	if (!doc?.head) return undefined
 	const endpointMeta = doc.head.querySelector('meta[name="lit-channel-endpoint"]')
@@ -82,8 +139,20 @@ export class SharedSocket {
 	/** @type {any[]} */
 	#queuedMessages = []
 
-	/** @type {MessagePort | { postMessage, onmessage, start, close } | null} */
+	/** @type {SharedSocketPort | null} */
 	#port = null
+
+	/** @type {SharedWorker | null} */
+	#worker = null
+
+	/** @type {'shared-worker' | 'broadcast-channel' | null} */
+	#transportType = null
+
+	/** @type {string | null} */
+	#currentWorkerUrl = null
+
+	/** @type {string | null} */
+	#currentWorkerVersion = null
 
 	/** @type {Promise | null} */
 	#initPromise = null
@@ -99,6 +168,11 @@ export class SharedSocket {
 		this.#reconnectAttempts = 0
 	}
 
+	/** @type {(event: MessageEvent) => void} */
+	#portControlListener = (event) => {
+		this.#handleControlMessage(event)
+	}
+
 	/** @type {EventTarget} */
 	#eventTarget = new EventTarget()
 
@@ -111,6 +185,15 @@ export class SharedSocket {
 	/** @type {AbortController | null} */
 	#reconnectController = null
 
+	/** @type {boolean} */
+	#isUpgradingWorker = false
+
+	/** @type {Promise<boolean> | null} */
+	#workerUpgradePromise = null
+
+	/** @type {Map<string, { resolve: Function, timeoutId: ReturnType<typeof setTimeout> | null }>} */
+	#controlWaiters = new Map()
+
 	/**
 	 * @param {{ endpoint?: string, workerUrl?: string, authToken?: string }} [options]
 	 */
@@ -118,6 +201,7 @@ export class SharedSocket {
 		this.#endpoint = options.endpoint ?? getConfiguredEndpoint()
 		this.#workerUrl = options.workerUrl ?? getConfiguredWorkerUrl()
 		this.#authToken = normalizeAuthToken(options.authToken ?? getConfiguredAuthToken())
+		getSocketRegistry()?.add(this)
 	}
 
 	/**
@@ -142,21 +226,16 @@ export class SharedSocket {
 			const workerUrl = resolveWorkerUrl(this.#workerUrl, window.location)
 
 			try {
-				const workerSource = await this.#resolveSharedWorkerSource(workerUrl)
-				const configMessage = { type: 'config', endpoint }
-				if (this.#authToken) {
-					configMessage.authToken = this.#authToken
-				}
-				const worker = new SharedWorker(workerSource, {
-					type: 'module',
-					name: 'lit-channel',
-				})
-				this.#port = worker.port
-				this.#port.start()
-				this.#port.postMessage(configMessage)
+				const { worker, port } = await this.#createSharedWorker(workerUrl)
+				this.#worker = worker
+				this.#port = port
+				this.#transportType = 'shared-worker'
+				this.#currentWorkerUrl = workerUrl
+				this.#currentWorkerVersion = this.#readWorkerVersion(workerUrl)
+				this.#postConfig(port, endpoint)
 
 				// Set up message handler to detect port disconnection
-				this.#setupPortMonitoring()
+				this.#setupPortMonitoring(port)
 
 				this.#flushQueuedMessages()
 				console.debug('[SharedSocket] using SharedWorker transport')
@@ -172,9 +251,13 @@ export class SharedSocket {
 		try {
 			const { createBroadcastTransport } = await import('./bc-transport.js')
 			this.#port = createBroadcastTransport({ endpoint, authToken: this.#authToken })
+			this.#worker = null
+			this.#transportType = 'broadcast-channel'
+			this.#currentWorkerUrl = null
+			this.#currentWorkerVersion = null
 			this.#port.start()
 
-			this.#setupPortMonitoring()
+			this.#setupPortMonitoring(this.#port)
 
 			this.#flushQueuedMessages()
 			console.debug('[SharedSocket] using BroadcastChannel transport (leader election)')
@@ -224,16 +307,108 @@ export class SharedSocket {
 		return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
 	}
 
-	#setupPortMonitoring() {
-		if (!this.#port) return
+	async #createSharedWorker(workerUrl) {
+		const workerSource = await this.#resolveSharedWorkerSource(workerUrl)
+		const worker = new SharedWorker(workerSource, {
+			type: 'module',
+			name: 'lit-channel',
+		})
+		const port = worker.port
+		port.start()
+		return { worker, port }
+	}
 
-		this.#port.onmessage = this.#messageHandler
-
-		if (typeof this.#port.removeEventListener === 'function') {
-			this.#port.removeEventListener('message', this.#portMessageListener)
+	#readWorkerVersion(workerUrl) {
+		try {
+			const url = new URL(workerUrl, window.location.href)
+			return url.searchParams.get('v') || url.searchParams.get('version') || url.toString()
+		} catch (_) {
+			return workerUrl || null
 		}
-		if (typeof this.#port.addEventListener === 'function') {
-			this.#port.addEventListener('message', this.#portMessageListener)
+	}
+
+	#buildConfigMessage(endpoint, upgrade) {
+		const configMessage = { type: 'config', endpoint }
+		if (this.#authToken) {
+			configMessage.authToken = this.#authToken
+		}
+		if (upgrade) {
+			configMessage.upgrade = upgrade
+		}
+		return configMessage
+	}
+
+	#postConfig(port, endpoint, upgrade) {
+		port.postMessage(this.#buildConfigMessage(endpoint, upgrade))
+	}
+
+	#setupPortMonitoring(port = this.#port) {
+		if (!port) return
+
+		port.onmessage = this.#messageHandler
+
+		if (typeof port.removeEventListener === 'function') {
+			port.removeEventListener('message', this.#portMessageListener)
+			port.removeEventListener('message', this.#portControlListener)
+		}
+		if (typeof port.addEventListener === 'function') {
+			port.addEventListener('message', this.#portMessageListener)
+			port.addEventListener('message', this.#portControlListener)
+		}
+	}
+
+	#teardownPortMonitoring(port) {
+		if (!port) return
+		if (typeof port.removeEventListener === 'function') {
+			port.removeEventListener('message', this.#portMessageListener)
+			port.removeEventListener('message', this.#portControlListener)
+		}
+		if (port.onmessage === this.#messageHandler) {
+			port.onmessage = null
+		}
+	}
+
+	#handleControlMessage(event) {
+		const message = event?.data
+		if (!message || typeof message !== 'object' || typeof message.type !== 'string') return false
+
+		const key = controlMessageKey(message.type, message.upgradeId)
+		const waiter = this.#controlWaiters.get(key)
+		if (!waiter) return false
+
+		this.#controlWaiters.delete(key)
+		if (waiter.timeoutId !== null) {
+			clearTimeout(waiter.timeoutId)
+		}
+		waiter.resolve(message)
+		return true
+	}
+
+	#waitForControlMessage(type, upgradeId, deadlineMs) {
+		const key = controlMessageKey(type, upgradeId)
+		const existing = this.#controlWaiters.get(key)
+		if (existing && existing.timeoutId !== null) {
+			clearTimeout(existing.timeoutId)
+		}
+
+		return new Promise((resolve) => {
+			const timeoutId = deadlineMs === 0
+				? null
+				: setTimeout(() => {
+					this.#controlWaiters.delete(key)
+					resolve(null)
+				}, deadlineMs)
+
+			this.#controlWaiters.set(key, { resolve, timeoutId })
+		})
+	}
+
+	#safeClosePort(port) {
+		if (!port?.close) return
+		try {
+			port.close()
+		} catch (error) {
+			console.debug('[SharedSocket] Error closing port:', error)
 		}
 	}
 
@@ -268,6 +443,12 @@ export class SharedSocket {
 	 * @param {any} data
 	 */
 	postMessage(data) {
+		if (this.#isUpgradingWorker) {
+			this.#queuedMessages.push(data)
+			console.debug('[SharedSocket] Queueing message (worker upgrade in progress)', data)
+			return
+		}
+
 		if (!this.#port) {
 			this.#queuedMessages.push(data)
 			console.debug('[SharedSocket] Queueing message (not connected yet)', data)
@@ -279,6 +460,110 @@ export class SharedSocket {
 		}
 
 		this.#port.postMessage(data)
+	}
+
+	/**
+	 * Upgrade the active SharedWorker to a new script URL without reloading the page.
+	 * @param {string} workerUrl
+	 * @param {{ workerVersion?: string, deadlineMs?: number }} [options]
+	 * @returns {Promise<boolean>} true when a SharedWorker transport was swapped
+	 */
+	async upgradeWorker(workerUrl, options = {}) {
+		if (typeof window === 'undefined') return false
+		if (!workerUrl || !('SharedWorker' in window)) return false
+
+		this.#workerUrl = workerUrl
+		if (!this.#port || this.#transportType !== 'shared-worker') return false
+		if (this.#workerUpgradePromise) return this.#workerUpgradePromise
+
+		this.#workerUpgradePromise = this.#doUpgradeWorker(workerUrl, options)
+		try {
+			return await this.#workerUpgradePromise
+		} finally {
+			this.#workerUpgradePromise = null
+		}
+	}
+
+	async #doUpgradeWorker(workerUrl, options = {}) {
+		const oldPort = this.#port
+		const oldWorkerUrl = this.#currentWorkerUrl
+		const oldWorkerVersion = this.#currentWorkerVersion
+		const nextWorkerUrl = resolveWorkerUrl(workerUrl, window.location)
+		const nextWorkerVersion = options.workerVersion || this.#readWorkerVersion(nextWorkerUrl)
+		const deadlineMs = normalizeDeadlineMs(options.deadlineMs)
+		const upgradeId = createUpgradeId()
+
+		if (!oldPort) return false
+		if (oldWorkerUrl === nextWorkerUrl) return false
+
+		this.#isUpgradingWorker = true
+		this.#emitEvent('upgrading', {
+			upgradeId,
+			from: oldWorkerUrl,
+			to: nextWorkerUrl,
+			workerVersion: nextWorkerVersion,
+		})
+
+		let newPort = null
+		try {
+			const statePromise = this.#waitForControlMessage(WORKER_UPGRADE_STATE, upgradeId, deadlineMs)
+			oldPort.postMessage({
+				type: WORKER_UPGRADE_PREPARE,
+				upgradeId,
+				nextWorkerUrl,
+				nextWorkerVersion,
+				deadlineMs,
+			})
+
+			const workerState = await statePromise
+			const { worker, port } = await this.#createSharedWorker(nextWorkerUrl)
+			newPort = port
+			this.#setupPortMonitoring(newPort)
+
+			const readyPromise = this.#waitForControlMessage(WORKER_UPGRADE_READY, upgradeId, deadlineMs)
+			const endpoint = resolveWebSocketUrl(this.#endpoint, window.location)
+			this.#postConfig(newPort, endpoint, {
+				upgradeId,
+				previousWorkerUrl: oldWorkerUrl,
+				previousWorkerVersion: oldWorkerVersion,
+				nextWorkerVersion,
+				topics: workerState?.topics || [],
+				pending: workerState?.pending || [],
+			})
+
+			const readyMessage = await readyPromise
+			this.#teardownPortMonitoring(oldPort)
+			this.#worker = worker
+			this.#port = newPort
+			this.#transportType = 'shared-worker'
+			this.#currentWorkerUrl = nextWorkerUrl
+			this.#currentWorkerVersion = readyMessage?.workerVersion || nextWorkerVersion
+			this.#isUpgradingWorker = false
+
+			this.#flushQueuedMessages()
+			this.#emitEvent('reconnected', { upgradeId, workerVersion: this.#currentWorkerVersion })
+
+			try {
+				oldPort.postMessage({ type: WORKER_UPGRADE_COMPLETE, upgradeId })
+			} catch (error) {
+				console.debug('[SharedSocket] Failed to complete old worker upgrade:', error)
+			}
+			setTimeout(() => this.#safeClosePort(oldPort), 0)
+			return true
+		} catch (error) {
+			if (newPort) {
+				this.#teardownPortMonitoring(newPort)
+				this.#safeClosePort(newPort)
+			}
+			if (oldWorkerUrl) {
+				this.#workerUrl = oldWorkerUrl
+			}
+			this.#isUpgradingWorker = false
+			this.#setupPortMonitoring(oldPort)
+			this.#flushQueuedMessages()
+			this.#emitEvent('upgrade-failed', { upgradeId, error })
+			throw error
+		}
 	}
 
 	async #attemptReconnect() {
@@ -363,6 +648,8 @@ export class SharedSocket {
 	 * Close the connection.
 	 */
 	async close() {
+		getSocketRegistry()?.delete(this)
+
 		// Cancel any pending reconnects
 		if (this.#reconnectController) {
 			this.#reconnectController.abort()
@@ -376,9 +663,21 @@ export class SharedSocket {
 				console.debug('[SharedSocket] Error closing port:', e)
 			}
 		}
+		this.#teardownPortMonitoring(this.#port)
 		this.#port = null
+		this.#worker = null
+		this.#transportType = null
+		this.#currentWorkerUrl = null
+		this.#currentWorkerVersion = null
+		this.#isUpgradingWorker = false
+		this.#workerUpgradePromise = null
 		this.#queuedMessages = []
 		this.#initPromise = null
 		this.#clearInlineWorkerBlobUrl()
+		for (const waiter of this.#controlWaiters.values()) {
+			if (waiter.timeoutId !== null) clearTimeout(waiter.timeoutId)
+			waiter.resolve(null)
+		}
+		this.#controlWaiters.clear()
 	}
 }
